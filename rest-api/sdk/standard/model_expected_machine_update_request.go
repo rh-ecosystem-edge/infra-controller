@@ -39,7 +39,7 @@ type ExpectedMachineUpdateRequest struct {
 	Interfaces []ExpectedMachineInterface `json:"interfaces,omitempty"`
 	// When true, replace the complete DPU-loopback subset with the loopback declarations in interfaces, clearing stored loopbacks omitted from the list. Requires non-null interfaces; an empty list clears all interface declarations. Omission, null, or false preserves stored loopbacks unless the interfaces list includes a DpuLoopback declaration (including one whose omitted role is preserved). This is request-only intent and is not stored on the Expected Machine.
 	ReplaceDpuLoopbacks NullableBool `json:"replaceDpuLoopbacks,omitempty"`
-	// Optional ID of an existing SKU at this Expected Machine's Site. Omission or null preserves the current SKU association in single and batch PATCH requests. REST rejects an empty string with HTTP 400. PATCH cannot remove the SKU association.
+	// Optional ID of an existing SKU at this Expected Machine's Site. Omission or null preserves the current SKU association in single and batch PATCH requests. REST rejects an empty string with HTTP 400. A supplied SKU with a pending deletion is rejected with HTTP 422 for single requests and HTTP 400 for batch requests. PATCH cannot remove the SKU association.
 	SkuId NullableString `json:"skuId,omitempty"`
 	// Optional rack identifier for this component
 	RackId NullableString `json:"rackId,omitempty"`
