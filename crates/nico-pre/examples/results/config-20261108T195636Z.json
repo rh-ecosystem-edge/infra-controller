@@ -1,0 +1,69 @@
+{
+  "tool": "nico-pre",
+  "version": "0.0.1",
+  "checklist": "config",
+  "site": "site1",
+  "started_at": "2026-11-08T19:56:36.054635Z",
+  "rows": [
+    {
+      "id": "sitedef.decisions",
+      "status": "pass",
+      "expected": "known entries, valid options, stated ones present, rules hold",
+      "observed": "5 stated, 5 implied, 10 in effect"
+    },
+    {
+      "id": "sitedef.network.prefix-aligned",
+      "status": "pass",
+      "expected": "every prefix is aligned to its mask",
+      "observed": "12 prefixes"
+    },
+    {
+      "id": "sitedef.network.no-overlap",
+      "status": "pass",
+      "expected": "no two prefixes overlap",
+      "observed": "disjoint"
+    },
+    {
+      "id": "sitedef.network.gateway-inside",
+      "status": "pass",
+      "expected": "every segment gateway lies inside its prefix",
+      "observed": "5 segments"
+    },
+    {
+      "id": "sitedef.network.pool-order",
+      "status": "pass",
+      "expected": "every pool has start at or below end",
+      "observed": "5 pools"
+    },
+    {
+      "id": "sitedef.network.asn-layout",
+      "status": "pass",
+      "expected": "the per-DPU ASN pool is clear of the datacenter and site controller ASNs",
+      "observed": "4244766860..4244766869"
+    },
+    {
+      "id": "sitedef.hosts.node-ids",
+      "status": "pass",
+      "expected": "node ids run from one without gaps",
+      "observed": "1..3"
+    },
+    {
+      "id": "sitedef.hosts.unique",
+      "status": "pass",
+      "expected": "unique hostnames and serials",
+      "observed": "3 site controllers"
+    },
+    {
+      "id": "sitedef.hosts.p0-mac",
+      "status": "pass",
+      "expected": "every stated p0 MAC parses",
+      "observed": "3 stated"
+    },
+    {
+      "id": "config.todo",
+      "status": "error",
+      "expected": "the checklist's checks",
+      "observed": "not implemented yet; only the site-definition gate ran"
+    }
+  ]
+}
