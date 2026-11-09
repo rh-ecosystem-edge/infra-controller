@@ -5,6 +5,7 @@ package manager
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -1169,17 +1170,43 @@ func (m *ManagerImpl) executeTask(
 		return nil, fmt.Errorf("operation rule is nil")
 	}
 
-	// Reload the durable union rather than admitting new devices on promotion
-	// or an idempotent retry of an unscheduled task.
+	var restartComponents []taskdef.WorkflowComponent
 	if len(task.Attributes.FirmwareRestartComputeIDs) > 0 {
-		var err error
-		targetRack, err = m.loadRackForTask(ctx, task)
+		var firmware operations.FirmwareControlTaskInfo
+		err := json.Unmarshal(task.Operation.Info, &firmware)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode firmware operation: %w", err)
 		}
-		if len(targetRack.Components) != len(task.Attributes.AllComponentUUIDs()) {
-			return nil, fmt.Errorf("NVOS task inventory changed: a reserved component is missing")
+		restartRequired := rule.RuleDefinition.RequiresNVOSComputeRestart(&firmware)
+		if restartRequired {
+			// Reload the durable union, never add devices that arrived after admission.
+			targetRack, err = m.loadRackForTask(ctx, task)
+			if err != nil {
+				return nil, err
+			}
+			if len(targetRack.Components) != len(task.Attributes.AllComponentUUIDs()) {
+				return nil, fmt.Errorf("NVOS task inventory changed: a reserved component is missing")
+			}
+			err = validateResolvedRackTargets(task.Operation, &rule.RuleDefinition,
+				map[uuid.UUID]*rack.Rack{task.RackID: targetRack})
+			if err != nil {
+				return nil, fmt.Errorf("NVOS restart targets: %w", err)
+			}
 		}
+		// A queued task's rule can change. Retain its original firmware targets
+		// even when the new rule no longer needs the saved restart-only devices.
+		firmwareRack := rack.New(targetRack.Info, targetRack.Loc)
+		for _, comp := range targetRack.Components {
+			if slices.Contains(task.Attributes.ComponentsByType[comp.Type], comp.Info.ID) {
+				firmwareRack.AddComponent(comp)
+			}
+			if restartRequired && slices.Contains(task.Attributes.FirmwareRestartComputeIDs, comp.Info.ID) {
+				restartComponents = append(restartComponents, taskdef.WorkflowComponent{
+					Type: comp.Type, ComponentID: comp.ComponentID, MACAddress: comp.ManagementMAC(),
+				})
+			}
+		}
+		targetRack = firmwareRack
 	}
 
 	err := validateResolvedRackTargets(
@@ -1207,19 +1234,7 @@ func (m *ManagerImpl) executeTask(
 		Async: true,
 	}
 
-	if len(task.Attributes.FirmwareRestartComputeIDs) > 0 {
-		firmwareRack := rack.New(targetRack.Info, targetRack.Loc)
-		for _, comp := range targetRack.Components {
-			if slices.Contains(task.Attributes.ComponentsByType[comp.Type], comp.Info.ID) {
-				firmwareRack.AddComponent(comp)
-			}
-			if slices.Contains(task.Attributes.FirmwareRestartComputeIDs, comp.Info.ID) {
-				req.Info.FirmwareRestartComponents = append(req.Info.FirmwareRestartComponents,
-					taskdef.WorkflowComponent{Type: comp.Type, ComponentID: comp.ComponentID, MACAddress: comp.ManagementMAC()})
-			}
-		}
-		req.Info.Components = workflowComponentsFrom(firmwareRack)
-	}
+	req.Info.FirmwareRestartComponents = restartComponents
 
 	return m.executor.Execute(ctx, &req)
 }

@@ -67,11 +67,9 @@ shutdown can leave compute off; inspect task status and device state before
 requesting recovery. The request's `overrideReadinessCheck` also applies to
 these power operations.
 
-The restart addresses the pre-2.0 GB firmware requirement tracked in
-[issue #8506](https://github.com/dsx-ai-factory/infra-controller/issues/8506).
-Flow does not infer a platform bundle version from the BMC version: this
-behavior applies to NVOS tasks regardless of that version. Tasks admitted
-before this behavior was deployed retain their original firmware-only scope.
+For NVOS update tasks, the rack-wide compute restart is part of the firmware
+workflow described in [issue #8506](https://github.com/dsx-ai-factory/infra-controller/issues/8506).
+Tasks admitted before this behavior was deployed retain their original scope.
 During an active NVOS task, keep Flow workers on the version that admitted it;
 older workers do not implement its compute restart continuation.
 

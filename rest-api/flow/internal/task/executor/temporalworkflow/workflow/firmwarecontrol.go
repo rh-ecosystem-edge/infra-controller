@@ -5,7 +5,6 @@ package workflow
 
 import (
 	"maps"
-	"slices"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -126,23 +125,7 @@ func firmwareRestartContinuations(
 		switchTarget.Len() == 0 || info.RuleDefinition == nil {
 		return nil
 	}
-	hasNVOSUpdate := false
-	for _, step := range info.RuleDefinition.Steps {
-		if step.ComponentType != devicetypes.ComponentTypeNVSwitch {
-			continue
-		}
-		for _, action := range step.OrderedActions() {
-			if action.Name == operationrules.ActionFirmwareControl {
-				hasNVOSUpdate = true
-			}
-		}
-	}
-	if !hasNVOSUpdate {
-		return nil
-	}
-	// Snapshot admission checks sub-targets; check again at execution because
-	// task histories and custom rules can originate outside the manager.
-	if len(firmware.SubTargets) != 0 && !slices.Contains(firmware.SubTargets, "nvos") {
+	if !info.RuleDefinition.RequiresNVOSComputeRestart(firmware) {
 		return nil
 	}
 	continuation := ruleContinuation{

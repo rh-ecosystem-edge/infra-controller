@@ -19,6 +19,7 @@ import (
 
 	activitypkg "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/executor/temporalworkflow/activity"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/executor/temporalworkflow/common"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/operationrules"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/operations"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/report"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/task"
@@ -27,19 +28,21 @@ import (
 
 func testNVOSRestartWorkflow(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		subTargets   []string
-		version      string
-		legacy       bool
-		legacyWorker bool
-		flashFails   bool
-		powerFails   bool
-		staysOn      bool
-		wantRestart  bool
+		name             string
+		subTargets       []string
+		version          string
+		legacy           bool
+		legacyWorker     bool
+		flashFails       bool
+		powerFails       bool
+		staysOn          bool
+		wantRestart      bool
+		noFirmwareAction bool
 	}{
 		{name: "NVOS waits for update then restarts all compute", subTargets: []string{"nvos"}, wantRestart: true},
 		{name: "whole bundle restarts compute", wantRestart: true},
 		{name: "BMC-only never restarts compute", subTargets: []string{"bmc"}},
+		{name: "custom rule without firmware action never restarts compute", noFirmwareAction: true},
 		{name: "omitted switch version layer never restarts", version: `{"compute":{"Id":"compute-fw"}}`},
 		{name: "predecessor history has no new commands", legacy: true},
 		{name: "old worker history with new input does not add commands", legacyWorker: true},
@@ -54,6 +57,10 @@ func testNVOSRestartWorkflow(t *testing.T) {
 			rule.Steps = rule.Steps[:1]
 			rule.Steps[0].ComponentType = devicetypes.ComponentTypeNVSwitch
 			rule.Steps[0].Stage = 8 // continuation must follow sparse/custom stages
+			if tc.noFirmwareAction {
+				rule.Steps[0].MainOperation = operationrules.ActionConfig{Name: operationrules.ActionSleep,
+					Parameters: map[string]any{operationrules.ParamDuration: "1s"}}
+			}
 			req := task.ExecutionInfo{TaskID: uuid.New(), RuleDefinition: rule,
 				Components:                []task.WorkflowComponent{{Type: devicetypes.ComponentTypeNVSwitch, ComponentID: "switch-1"}},
 				FirmwareRestartComponents: firmwareTestComponents("compute-1", "compute-2")}

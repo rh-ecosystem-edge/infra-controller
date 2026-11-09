@@ -267,7 +267,16 @@ func validateRequiredCapabilities(
 		return err
 	}
 
-	if len(info.FirmwareRestartComponents) > 0 {
+	restartRequired := false
+	if len(info.FirmwareRestartComponents) > 0 && info.OperationType == taskcommon.TaskTypeFirmwareControl {
+		op, decodeErr := operations.New(info.OperationType, info.OperationInfo)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		firmware, ok := op.(*operations.FirmwareControlTaskInfo)
+		restartRequired = ok && info.RuleDefinition.RequiresNVOSComputeRestart(firmware)
+	}
+	if restartRequired {
 		restartRequirements, restartErr := capabilityrequirements.Required(
 			&operationrules.RuleDefinition{Steps: operationrules.ComputeRestartSteps()},
 			executionComponentTypes(info.FirmwareRestartComponents),

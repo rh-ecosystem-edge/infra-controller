@@ -23,14 +23,16 @@ import (
 
 func testNVOSRestartSubmission(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		targets  []string
-		version  string
-		snapshot bool
-		missing  bool
-		unlinked bool
-		conflict bool
-		legacy   bool
+		name           string
+		targets        []string
+		version        string
+		snapshot       bool
+		missing        bool
+		unlinked       bool
+		conflict       bool
+		legacy         bool
+		noFirmwareRule bool
+		changedRule    bool
 	}{
 		{name: "NVOS snapshots full compute scope", targets: []string{"nvos"}, snapshot: true},
 		{name: "whole bundle includes NVOS", snapshot: true},
@@ -40,6 +42,8 @@ func testNVOSRestartSubmission(t *testing.T) {
 		{name: "unaddressable compute rejects before persistence", targets: []string{"nvos"}, unlinked: true},
 		{name: "compute power task blocks switch NVOS update", targets: []string{"nvos"}, conflict: true},
 		{name: "predecessor task retains firmware-only behavior", targets: []string{"nvos"}, snapshot: true, legacy: true},
+		{name: "custom rule without update ignores unaddressable compute", targets: []string{"nvos"}, noFirmwareRule: true, unlinked: true},
+		{name: "changed rule no longer requires missing restart-only compute", targets: []string{"nvos"}, snapshot: true, changedRule: true, missing: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rackID, switchID, computeID := uuid.New(), uuid.New(), uuid.New()
@@ -53,6 +57,14 @@ func testNVOSRestartSubmission(t *testing.T) {
 			fullRack.AddComponent(compute)
 			inv := &submitTaskInventory{rack: fullRack, components: map[uuid.UUID]*component.Component{switchID: &sw}}
 			store := &managerTaskStore{}
+			if tc.noFirmwareRule {
+				store.operationRule = &operationrules.OperationRule{ID: uuid.New(),
+					RuleDefinition: operationrules.RuleDefinition{Version: "v1", Steps: []operationrules.SequenceStep{{
+						ComponentType: devicetypes.ComponentTypeNVSwitch, Stage: 1,
+						MainOperation: operationrules.ActionConfig{Name: operationrules.ActionSleep,
+							Parameters: map[string]any{operationrules.ParamDuration: "1s"}},
+					}}}}
+			}
 			exec := &managerExecutor{executionID: "execution-1"}
 			m := &ManagerImpl{inventoryStore: inv, taskStore: store, executor: exec,
 				ruleResolver: operationrules.NewResolver(store), conflictResolver: conflict.NewResolver(store)}
@@ -67,7 +79,7 @@ func testNVOSRestartSubmission(t *testing.T) {
 				TargetSpec: operation.TargetSpec{Components: []operation.ComponentTarget{{UUID: switchID}}},
 			})
 			require.NoError(t, err)
-			if tc.unlinked || tc.conflict {
+			if (tc.unlinked && !tc.noFirmwareRule) || tc.conflict {
 				require.Empty(t, ids)
 				require.Zero(t, store.createTaskCalls)
 				require.Zero(t, exec.executeCalls)
@@ -101,16 +113,24 @@ func testNVOSRestartSubmission(t *testing.T) {
 				fullRack.Components = fullRack.Components[:1]
 			}
 			fullRack.AddComponent(newTestComponent(uuid.New(), rackID, devicetypes.ComponentTypeCompute, "late-compute"))
+			if tc.changedRule {
+				store.operationRule = &operationrules.OperationRule{ID: uuid.New(),
+					RuleDefinition: operationrules.RuleDefinition{Version: "v1", Steps: []operationrules.SequenceStep{{
+						ComponentType: devicetypes.ComponentTypeNVSwitch, Stage: 1,
+						MainOperation: operationrules.ActionConfig{Name: operationrules.ActionSleep,
+							Parameters: map[string]any{operationrules.ParamDuration: "1s"}},
+					}}}}
+			}
 			store.tasksByID = map[uuid.UUID]*taskdef.Task{saved.ID: &saved}
 			err = m.promoteTask(context.Background(), saved.ID)
-			if tc.missing {
+			if tc.missing && !tc.changedRule {
 				require.ErrorContains(t, err, "reserved component is missing")
 				require.Equal(t, 1, exec.executeCalls)
 				return
 			}
 			require.NoError(t, err)
 			require.Len(t, exec.lastRequest.Info.Components, 1)
-			if tc.snapshot && !tc.legacy {
+			if tc.snapshot && !tc.legacy && !tc.changedRule {
 				require.Equal(t, []taskdef.WorkflowComponent{{Type: devicetypes.ComponentTypeCompute, ComponentID: "compute-1"}}, exec.lastRequest.Info.FirmwareRestartComponents)
 			} else {
 				require.Empty(t, exec.lastRequest.Info.FirmwareRestartComponents)

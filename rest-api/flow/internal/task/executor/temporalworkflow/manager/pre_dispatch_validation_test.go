@@ -26,11 +26,13 @@ import (
 
 func TestValidateRequiredCapabilitiesRejectsUnsupportedCapability(t *testing.T) {
 	for _, tc := range []struct {
-		name            string
-		firmwareRestart bool
+		name             string
+		firmwareRestart  bool
+		noFirmwareAction bool
 	}{
 		{name: "power task"},
 		{name: "NVOS restart requires compute power capability before flashing", firmwareRestart: true},
+		{name: "custom rule without update ignores saved restart capabilities", firmwareRestart: true, noFirmwareAction: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			registry := newPreflightCapabilityRegistry(t, capability.CapabilityPowerStatus)
@@ -39,8 +41,18 @@ func TestValidateRequiredCapabilitiesRejectsUnsupportedCapability(t *testing.T) 
 				registry = newPreflightFirmwareRegistry(t, nil)
 				info = firmwareControlExecutionInfo(t)
 				info.FirmwareRestartComponents = info.Components
+				info.Components = []task.WorkflowComponent{{Type: devicetypes.ComponentTypeNVSwitch, ComponentID: "switch-1"}}
+				info.RuleDefinition.Steps[0].ComponentType = devicetypes.ComponentTypeNVSwitch
+				if tc.noFirmwareAction {
+					info.RuleDefinition.Steps[0].MainOperation = operationrules.ActionConfig{Name: operationrules.ActionSleep,
+						Parameters: map[string]any{operationrules.ParamDuration: "1s"}}
+				}
 			}
 			err := validateRequiredCapabilities(info, registry)
+			if tc.noFirmwareAction {
+				require.NoError(t, err)
+				return
+			}
 			require.ErrorIs(t, err, componentmanager.ErrUnsupportedCapability)
 			var capabilityErr componentmanager.UnsupportedCapabilityError
 			require.ErrorAs(t, err, &capabilityErr)
@@ -183,31 +195,23 @@ func newPreflightFirmwareRegistry(
 ) *componentmanager.Registry {
 	t.Helper()
 
-	descriptor := cmcatalog.Descriptor{
-		DescriptorIdentity: cmcatalog.DescriptorIdentity{
-			Type:           devicetypes.ComponentTypeCompute,
-			Implementation: "limited-firmware",
-		},
-		Capabilities: capability.CapabilitySet{
-			capability.CapabilityFirmwareControl,
-			capability.CapabilityFirmwareStatus,
-		},
-	}
-	registry, err := componentmanager.NewRegistry(
-		[]componentmanager.FactorySpec{{
+	var factories []componentmanager.FactorySpec
+	configured := make(map[devicetypes.ComponentType]string)
+	for _, ct := range []devicetypes.ComponentType{devicetypes.ComponentTypeCompute, devicetypes.ComponentTypeNVSwitch} {
+		descriptor := cmcatalog.Descriptor{
+			DescriptorIdentity: cmcatalog.DescriptorIdentity{Type: ct, Implementation: "limited-firmware"},
+			Capabilities:       capability.CapabilitySet{capability.CapabilityFirmwareControl, capability.CapabilityFirmwareStatus},
+		}
+		factories = append(factories, componentmanager.FactorySpec{
 			Descriptor: descriptor,
 			Factory: func(*providerapi.ProviderRegistry) (componentmanager.ComponentManager, error) {
-				return preflightCapabilityManager{
-					descriptor:            descriptor,
-					firmwareValidationErr: validationErr,
-				}, nil
+				return preflightCapabilityManager{descriptor: descriptor, firmwareValidationErr: validationErr}, nil
 			},
-		}},
-		cmconfig.Config{ComponentManagers: map[devicetypes.ComponentType]string{
-			devicetypes.ComponentTypeCompute: "limited-firmware",
-		}},
-		providerapi.NewProviderRegistry(),
-	)
+		})
+		configured[ct] = "limited-firmware"
+	}
+	registry, err := componentmanager.NewRegistry(factories,
+		cmconfig.Config{ComponentManagers: configured}, providerapi.NewProviderRegistry())
 	require.NoError(t, err)
 	return registry
 }

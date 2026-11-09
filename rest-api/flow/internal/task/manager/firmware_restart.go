@@ -17,7 +17,6 @@ import (
 	taskdef "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/task"
 	identifier "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/Identifier"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/devicetypes"
-	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/common/firmwareversion"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/pkg/inventoryobjects/rack"
 )
 
@@ -34,12 +33,14 @@ func (m *ManagerImpl) newFirmwareTaskForRack(
 	if err != nil {
 		return task, fmt.Errorf("decode firmware operation: %w", err)
 	}
-	if len(info.SubTargets) != 0 && !slices.Contains(info.SubTargets, "nvos") {
-		return task, nil
+	rule, err := m.resolveOperationRule(ctx, req.Operation, task.RackID)
+	if err != nil {
+		return task, err
 	}
-
-	_, switchSelected := firmwareversion.Extract(info.TargetVersion, devicetypes.ComponentTypeNVSwitch)
-	if !switchSelected {
+	if rule == nil {
+		return task, fmt.Errorf("resolver returned nil rule")
+	}
+	if !rule.RuleDefinition.RequiresNVOSComputeRestart(&info) {
 		return task, nil
 	}
 
