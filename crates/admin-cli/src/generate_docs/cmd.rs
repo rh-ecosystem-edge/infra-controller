@@ -570,7 +570,7 @@ fn intro(d: CliDomain) -> &'static str {
         CliDomain::Hardware => {
             "Live hardware and lifecycle operations: machines, BMC, DPUs, firmware \
              and component lifecycle, attestation, low-level passthrough (Redfish, \
-             RMS, MLX), and operator utilities."
+             MLX), and operator utilities."
         }
         CliDomain::Network => {
             "VPCs, peerings, prefixes, network segments and devices, security groups, \
