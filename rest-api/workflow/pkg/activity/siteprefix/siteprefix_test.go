@@ -647,7 +647,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			check func(*testing.T, testFixture)
 		}{
 			{"reported Deleting removes free root and restores same identity", func(t *testing.T, f testFixture) {
-				root := f.root(t, true)
+				root := f.root(t)
 				prefix := testPrefix()
 				prefix.Id.Value = root.SitePrefixID.String()
 				prefix.Status.LifecycleState = corev1.SitePrefixLifecycleState_SITE_PREFIX_LIFECYCLE_STATE_DELETING
@@ -666,7 +666,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			}},
 
 			{"full grant survives retirement unlink and adoption without an IPAM child", func(t *testing.T, f testFixture) {
-				root := f.root(t, true)
+				root := f.root(t)
 				ageBlock(t, f, root)
 				child := f.allocateRoot(t, root, root.PrefixLength)
 				constraints, _, err := cdbm.NewAllocationConstraintDAO(f.session).GetAll(ctx, nil,
@@ -711,7 +711,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				require.Equal(t, prefix, preservedPrefix)
 			}},
 			{"missing allocated root clears its link and is adopted by a new Core ID", func(t *testing.T, f testFixture) {
-				root := f.root(t, true)
+				root := f.root(t)
 				ageBlock(t, f, root)
 				allocator := cipam.NewWithStorage(ipam.NewIpamStorage(f.session.DB, nil))
 				allocator.SetNamespace(f.namespace())
@@ -796,7 +796,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			}
 			t.Run(name, func(t *testing.T) {
 				f := newTestFixture(t)
-				root := f.root(t, true)
+				root := f.root(t)
 				ageBlock(t, f, root)
 				_, err := f.session.DB.ExecContext(ctx, `CREATE FUNCTION reject_prefix_retirement() RETURNS trigger AS $$ BEGIN IF NEW.deleted IS NOT NULL THEN RAISE EXCEPTION 'injected retirement failure'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`)
 				require.NoError(t, err)
@@ -845,7 +845,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			}
 			t.Run(name, func(t *testing.T) {
 				f := newTestFixture(t)
-				root := f.root(t, true)
+				root := f.root(t)
 				ids := []string{root.SitePrefixID.String(), uuid.NewString()}
 				slices.Sort(ids)
 				oldIndex := 0
@@ -921,7 +921,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				f := newTestFixture(t)
-				root := f.root(t, true)
+				root := f.root(t)
 				ageBlock(t, f, root)
 				child := f.allocateRoot(t, root, 28)
 				old := testPrefix()
@@ -2303,7 +2303,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			f := newTestFixture(t)
 			inventory := testSitePrefixInventory(lockReported)
 			if tt.missing {
-				root := f.root(t, true)
+				root := f.root(t)
 				ageBlock(t, f, root)
 				inventory = testSitePrefixInventory(nil)
 			}
@@ -2763,13 +2763,9 @@ func TestValidatePrefix(t *testing.T) {
 	}
 }
 
-func (f testFixture) root(t *testing.T, linked bool) *cdbm.IPBlock {
+func (f testFixture) root(t *testing.T) *cdbm.IPBlock {
 	t.Helper()
-	id := ""
-	if linked {
-		id = uuid.NewString()
-	}
-	f.createExistingIPBlocks(t, []testExistingIPBlock{{cidr: "10.0.0.0/24", name: "existing-root", sitePrefixID: id}})
+	f.createExistingIPBlocks(t, []testExistingIPBlock{{cidr: "10.0.0.0/24", name: "existing-root", sitePrefixID: uuid.NewString()}})
 	return &f.blocks(t)[0]
 }
 func (f testFixture) namespace() string {

@@ -117,12 +117,10 @@ func (manager ManageSitePrefix) UpdateSitePrefixesInDB(ctx context.Context, site
 		// Keep one prefix's changes atomic, except retirement cleanup uses a
 		// savepoint so a cleanup failure preserves the Deleting lifecycle.
 		// A failed prefix must not roll back earlier prefixes in the page.
-		isLockContention := false
 		id := uuid.MustParse(prefix.GetId().GetValue()) // validated before the transaction
 		reconciledBlock, err := cdb.WithTxResult(ctx, manager.dbSession, func(tx *cdb.Tx) (*cdbm.IPBlock, error) {
 			err := tx.TryAcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(site.InfrastructureProviderID, siteID), nil)
 			if err != nil {
-				isLockContention = isSiteFabricLockContention(err)
 				return nil, err
 			}
 			lockedSite, err := siteDAO.GetByID(ctx, tx, siteID, nil, false, true)
@@ -193,7 +191,7 @@ func (manager ManageSitePrefix) UpdateSitePrefixesInDB(ctx context.Context, site
 			return block, nil
 		})
 		if err != nil {
-			if isLockContention {
+			if isSiteFabricLockContention(err) {
 				logger.Warn().Err(err).Str("Site Prefix ID", prefix.GetId().GetValue()).
 					Msg("skipping SitePrefix after bounded Site fabric lock contention retries")
 				continue
@@ -245,11 +243,9 @@ func (manager ManageSitePrefix) reconcileAbsence(ctx context.Context, site *cdbm
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		isLockContention := false
 		err = cdb.WithTx(ctx, manager.dbSession, func(tx *cdb.Tx) error {
 			err := tx.TryAcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(site.InfrastructureProviderID, site.ID), nil)
 			if err != nil {
-				isLockContention = isSiteFabricLockContention(err)
 				return err
 			}
 			lockedSite, err := cdbm.NewSiteDAO(manager.dbSession).GetByID(ctx, tx, site.ID, nil, false, true)
@@ -286,7 +282,7 @@ func (manager ManageSitePrefix) reconcileAbsence(ctx context.Context, site *cdbm
 			return nil
 		})
 		if err != nil {
-			if isLockContention {
+			if isSiteFabricLockContention(err) {
 				logger.Warn().Err(err).Str("IP Block ID", candidate.ID.String()).
 					Msg("skipping missing SitePrefix after bounded Site fabric lock contention retries")
 				continue

@@ -403,6 +403,14 @@ configuration. Otherwise, inventory collection fails and IP Block changes are no
 applied. Until the Site Agent is upgraded, fabric-prefix changes are not reconciled
 for that Site. Existing workflow histories remain replay-compatible.
 
+Absence handling requires a successful complete inventory. For paged inventories,
+the final page must carry the full ID list; an empty list is accepted when the
+Site reports zero items. An unpaged message is treated as the whole inventory.
+Only IP Blocks still linked to a SitePrefix and created before the Site's
+stale-inventory window are eligible; recent records are preserved. That window
+uses the Site Agent's reported collection interval, or the default interval if
+the Site has not reported one.
+
 Tenant-created IP Blocks (`managed: false`) are tracked by the receiver but are not
 exposed through the IP Block endpoints. If they disappear from the Site, they
 become `Error` unless already `Deleting`, in which case they are removed. IP Blocks
