@@ -394,6 +394,28 @@ Moving a site off Vault entirely, including certificate issuance and the Vault i
 
 ## Version-specific upgrade notes
 
+### Upgrades That Introduce SitePrefix Inventory
+
+Deploy the Site Agent publisher together with the Cloud receiver. Before rollout,
+ensure Core supports `Version(display_config=true)`, `FindSitePrefixIds`, and
+`FindSitePrefixesByIds`, with a positive `max_find_by_ids` in the returned runtime
+configuration. Otherwise, inventory collection fails and IP Block changes are not
+applied. Until the Site Agent is upgraded, fabric-prefix changes are not reconciled
+for that Site. Existing workflow histories remain replay-compatible.
+
+Tenant-created IP Blocks (`managed: false`) are tracked by the receiver but are not
+exposed through the IP Block endpoints. If they disappear from the Site, they
+become `Error` unless already `Deleting`, in which case they are removed. IP Blocks
+created through Allocation remain managed and are unaffected by this absence
+handling. For operator-managed ranges, see
+[Creating Site IP Blocks](/infra-controller/rest-api-reference/getting-started#creating-site-ip-blocks).
+
+See the
+[publication and retirement requirements](https://github.com/dsx-ai-factory/infra-controller/issues/5763),
+[receiver requirements](https://github.com/dsx-ai-factory/infra-controller/issues/5762),
+and [receiver implementation](https://github.com/dsx-ai-factory/infra-controller/pull/7008)
+for the migration details.
+
 ### Upgrades That Introduce Asynchronous Peering Deletion
 
 Follow these steps the first time you upgrade to the peering deletion behavior

@@ -136,6 +136,8 @@ type testExistingIPBlock struct {
 	cidr        string
 	name        string
 	description string
+	status      string
+	createdAgo  time.Duration
 	// public gives the IP Block the Public routing type instead of DatacenterOnly.
 	public bool
 	// sitePrefixID links the IP Block to a Core SitePrefix. Empty leaves it unlinked.
@@ -257,6 +259,10 @@ func (f testFixture) createExistingIPBlocks(t *testing.T, blocks []testExistingI
 		if block.tenantOrg != "" {
 			tenantID = &f.tenants[block.tenantOrg].ID
 		}
+		status := block.status
+		if status == "" {
+			status = cdbm.IPBlockStatusReady
+		}
 		created, err := dao.Create(ctx, nil, cdbm.IPBlockCreateInput{
 			Name:                     block.name,
 			Description:              description,
@@ -269,7 +275,7 @@ func (f testFixture) createExistingIPBlocks(t *testing.T, blocks []testExistingI
 			Prefix:                   prefix.Addr().String(),
 			PrefixLength:             prefix.Bits(),
 			ProtocolVersion:          protocolVersion,
-			Status:                   cdbm.IPBlockStatusReady,
+			Status:                   status,
 			CreatedBy:                &f.user.ID,
 		})
 		require.NoError(t, err)
@@ -285,6 +291,11 @@ func (f testFixture) createExistingIPBlocks(t *testing.T, blocks []testExistingI
 			allocator.SetNamespace(ipam.GetIpamNamespaceForIPBlock(ctx, created.RoutingType,
 				created.InfrastructureProviderID.String(), created.SiteID.String()))
 			_, err = allocator.AcquireChildPrefix(ctx, block.cidr, 28)
+			require.NoError(t, err)
+		}
+		if block.createdAgo > 0 {
+			_, err = f.session.DB.NewUpdate().Model(created).
+				Set("created = ?", time.Now().Add(-block.createdAgo)).WherePK().Exec(ctx)
 			require.NoError(t, err)
 		}
 		if !block.retired {
@@ -653,44 +664,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				_, err = ipam.NewIpamStorage(f.session.DB, nil).ReadPrefix(ctx, "10.0.0.0/24", f.namespace())
 				require.NoError(t, err)
 			}},
-			{"Deleting adopts and retires a compatible unlinked root regardless of its name", func(t *testing.T, f testFixture) {
-				root := f.root(t, false)
-				prefix := testPrefix()
-				prefix.Status.LifecycleState = corev1.SitePrefixLifecycleState_SITE_PREFIX_LIFECYCLE_STATE_DELETING
-				require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, testInventory(prefix)))
-				retired := f.blocks(t)[0]
-				require.Equal(t, root.ID, retired.ID)
-				require.Equal(t, root.Name, retired.Name)
-				require.Equal(t, prefix.Id.Value, retired.SitePrefixID.String())
-				require.Equal(t, cdbm.IPBlockStatusDeleting, retired.Status)
-				require.NotNil(t, retired.Deleted)
-				_, err := ipam.NewIpamStorage(f.session.DB, nil).ReadPrefix(ctx, "10.0.0.0/24", f.namespace())
-				require.Error(t, err)
-			}},
-			{"invalid payload preserves its reported root without blocking absence cleanup", func(t *testing.T, f testFixture) {
-				reportedID, missingID := uuid.New(), uuid.New()
-				f.createExistingIPBlocks(t, []testExistingIPBlock{
-					{cidr: "10.0.0.0/24", name: "reported-root", sitePrefixID: reportedID.String()},
-					{cidr: "10.1.0.0/24", name: "missing-root", sitePrefixID: missingID.String()},
-				})
-				for _, block := range f.blocks(t) {
-					ageBlock(t, f, &block)
-				}
-				before := f.blocksByID(t)
-				prefix := testPrefix()
-				prefix.Id.Value = reportedID.String()
-				prefix.Config = nil
-				inventory := testInventory(prefix)
-				require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, inventory))
-				reported, err := f.blockByPrefixID(ctx, reportedID)
-				require.NoError(t, err)
-				require.Equal(t, before[reported.ID], *reported)
-				missing, err := f.blockByPrefixID(ctx, missingID)
-				require.NoError(t, err)
-				require.Equal(t, cdbm.IPBlockStatusDeleting, missing.Status)
-				require.NotNil(t, missing.Deleted)
-				require.Equal(t, []string{"10.0.0.0/24"}, f.ipamCIDRs(t, cdbm.IPBlockRoutingTypeDatacenterOnly))
-			}},
+
 			{"full grant survives retirement unlink and adoption without an IPAM child", func(t *testing.T, f testFixture) {
 				root := f.root(t, true)
 				ageBlock(t, f, root)
@@ -810,84 +784,6 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 					cdbm.StatusDetailFilterInput{EntityIDs: []string{deleting.ID.String()}}, paginator.PageInput{})
 				require.NoError(t, err)
 				require.Len(t, details, 1, "delayed Ready must not add a status detail")
-			}},
-			{"absence only sweeps eligible linked blocks", func(t *testing.T, f testFixture) {
-				for _, row := range []struct {
-					name                            string
-					managed, tenant, linked, recent bool
-					status, wantStatus              string
-					wantDeleted                     bool
-				}{
-					{"unlinked operator", true, false, false, false, cdbm.IPBlockStatusReady, cdbm.IPBlockStatusReady, false},
-					{"allocated tenant", true, true, true, false, cdbm.IPBlockStatusReady, cdbm.IPBlockStatusReady, false},
-					{"missing tenant", false, true, true, false, cdbm.IPBlockStatusReady, cdbm.IPBlockStatusError, false},
-					{"recent retiring tenant", false, true, true, true, cdbm.IPBlockStatusDeleting, cdbm.IPBlockStatusDeleting, false},
-				} {
-					t.Run(row.name, func(t *testing.T) {
-						var tenantID, prefixID *uuid.UUID
-						if row.tenant {
-							tenantID = &f.tenants["tenant"].ID
-						}
-						if row.linked {
-							prefixID = cutil.GetPtr(uuid.New())
-						}
-						dao := cdbm.NewIPBlockDAO(f.session)
-						block, err := dao.Create(ctx, nil, cdbm.IPBlockCreateInput{
-							Name: row.name, Prefix: "10.1.0.0", PrefixLength: 24, SiteID: f.site.ID,
-							InfrastructureProviderID: f.site.InfrastructureProviderID, TenantID: tenantID,
-							SitePrefixID: prefixID, Managed: &row.managed, Status: row.status,
-							RoutingType: cdbm.IPBlockRoutingTypeDatacenterOnly, ProtocolVersion: cdbm.IPBlockProtocolVersionV4,
-						})
-						require.NoError(t, err)
-						if !row.recent {
-							ageBlock(t, f, block)
-						}
-						inventory := &corev1.SitePrefixInventory{InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-							InventoryPage: &corev1.InventoryPage{CurrentPage: 1}}
-						require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, inventory))
-						all := f.blocks(t)
-						index := slices.IndexFunc(all, func(b cdbm.IPBlock) bool { return b.ID == block.ID })
-						require.NotEqual(t, -1, index)
-						require.Equal(t, row.wantStatus, all[index].Status)
-						require.Equal(t, row.wantDeleted, all[index].Deleted != nil)
-						require.Equal(t, prefixID, all[index].SitePrefixID)
-					})
-				}
-			}},
-			{"nonfinal and failed inventories preserve old missing root", func(t *testing.T, f testFixture) {
-				root := f.root(t, true)
-				ageBlock(t, f, root)
-				before := f.blocks(t)
-				for _, inventory := range []*corev1.SitePrefixInventory{
-					{InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS, InventoryPage: &corev1.InventoryPage{CurrentPage: 1, TotalPages: 2, TotalItems: 1}},
-					{InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS, InventoryPage: &corev1.InventoryPage{CurrentPage: 2, TotalPages: 2, TotalItems: 1}},
-					{InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_FAILED},
-				} {
-					require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, inventory))
-					require.Equal(t, before, f.blocks(t))
-				}
-			}},
-			{"final page alone preserves listed roots and removes missing roots", func(t *testing.T, f testFixture) {
-				reportedID, missingID := uuid.New(), uuid.New()
-				f.createExistingIPBlocks(t, []testExistingIPBlock{
-					{cidr: "10.0.0.0/24", name: "reported-root", sitePrefixID: reportedID.String()},
-					{cidr: "10.1.0.0/24", name: "missing-root", sitePrefixID: missingID.String()},
-				})
-				for _, block := range f.blocks(t) {
-					ageBlock(t, f, &block)
-				}
-				before := f.blocksByID(t)
-				inventory := &corev1.SitePrefixInventory{InventoryStatus: corev1.InventoryStatus_INVENTORY_STATUS_SUCCESS,
-					InventoryPage: &corev1.InventoryPage{CurrentPage: 2, TotalPages: 2, TotalItems: 1, ItemIds: []string{reportedID.String()}}}
-				require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, inventory))
-				reported, err := f.blockByPrefixID(ctx, reportedID)
-				require.NoError(t, err)
-				require.Equal(t, before[reported.ID], *reported)
-				missing, err := f.blockByPrefixID(ctx, missingID)
-				require.NoError(t, err)
-				require.Equal(t, cdbm.IPBlockStatusDeleting, missing.Status)
-				require.NotNil(t, missing.Deleted)
-				require.Equal(t, []string{"10.0.0.0/24"}, f.ipamCIDRs(t, cdbm.IPBlockRoutingTypeDatacenterOnly))
 			}},
 		}
 		for _, tc := range cases {
@@ -1110,6 +1006,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 		failedInventory            bool
 		useUnknownSiteID           bool
 		inventoryAge               time.Duration
+		inventoryPage              *corev1.InventoryPage
 		finalPage                  bool
 		omitPageMetadata           bool
 		// failStatusDetailInsert fails the Nth status detail insert of the call under test.
@@ -1131,6 +1028,105 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 		retryIPBlocks []testIPBlockState
 		retryIPAM     []string
 	}{
+		{
+			name: "Deleting adopts and retires a compatible unlinked root regardless of its name",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "rest-name"},
+			},
+			reported: []testSitePrefix{
+				{id: idA, cidr: "10.0.0.0/24", name: "core-name", state: deleting},
+			},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "rest-name", sitePrefixID: idA,
+					status: cdbm.IPBlockStatusDeleting, existing: true, deleted: true, statusDetails: 1},
+			},
+		},
+		{
+			name: "absence leaves an unlinked operator root unchanged",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "rest-name", createdAgo: time.Hour},
+			},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "rest-name", status: cdbm.IPBlockStatusReady, existing: true, unchanged: true},
+			},
+			wantIPAM: []string{"10.0.0.0/24"},
+		},
+		{
+			name: "absence marks an old tenant-created IP Block Error",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "tenant-prefix", sitePrefixID: idA, tenantOrg: "tenant", createdAgo: time.Hour},
+			},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "tenant-prefix", sitePrefixID: idA, tenantOrg: "tenant",
+					status: cdbm.IPBlockStatusError, existing: true, statusDetails: 1},
+			},
+		},
+		{
+			name: "absence preserves a recent Deleting tenant-created IP Block",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "tenant-prefix", sitePrefixID: idA, tenantOrg: "tenant", status: cdbm.IPBlockStatusDeleting},
+			},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "tenant-prefix", sitePrefixID: idA, tenantOrg: "tenant",
+					status: cdbm.IPBlockStatusDeleting, existing: true, unchanged: true},
+			},
+		},
+		{
+			name: "nonfinal page preserves an old missing root",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "rest-name", sitePrefixID: idA, createdAgo: time.Hour},
+			},
+			inventoryPage: &corev1.InventoryPage{CurrentPage: 1, TotalPages: 2, TotalItems: 1},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "rest-name", sitePrefixID: idA,
+					status: cdbm.IPBlockStatusReady, existing: true, unchanged: true},
+			},
+			wantIPAM: []string{"10.0.0.0/24"},
+		},
+		{
+			name: "final page without the full ID list preserves an old missing root",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "rest-name", sitePrefixID: idA, createdAgo: time.Hour},
+			},
+			inventoryPage: &corev1.InventoryPage{CurrentPage: 2, TotalPages: 2, TotalItems: 1},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "rest-name", sitePrefixID: idA,
+					status: cdbm.IPBlockStatusReady, existing: true, unchanged: true},
+			},
+			wantIPAM: []string{"10.0.0.0/24"},
+		},
+		{
+			name: "invalid payload preserves its reported root without blocking absence cleanup",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "reported-root", sitePrefixID: idA, createdAgo: time.Hour},
+				{cidr: "10.1.0.0/24", name: "missing-root", sitePrefixID: idB, createdAgo: time.Hour},
+			},
+			reported: []testSitePrefix{
+				{id: idA, omitConfig: true},
+			},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "reported-root", sitePrefixID: idA,
+					status: cdbm.IPBlockStatusReady, existing: true, unchanged: true},
+				{cidr: "10.1.0.0/24", name: "missing-root", sitePrefixID: idB,
+					status: cdbm.IPBlockStatusDeleting, existing: true, deleted: true, statusDetails: 1},
+			},
+			wantIPAM: []string{"10.0.0.0/24"},
+		},
+		{
+			name: "final page alone preserves listed roots and removes missing roots",
+			existingIPBlocks: []testExistingIPBlock{
+				{cidr: "10.0.0.0/24", name: "reported-root", sitePrefixID: idA, createdAgo: time.Hour},
+				{cidr: "10.1.0.0/24", name: "missing-root", sitePrefixID: idB, createdAgo: time.Hour},
+			},
+			inventoryPage: &corev1.InventoryPage{CurrentPage: 2, TotalPages: 2, TotalItems: 1, ItemIds: []string{idA}},
+			wantIPBlocks: []testIPBlockState{
+				{cidr: "10.0.0.0/24", name: "reported-root", sitePrefixID: idA,
+					status: cdbm.IPBlockStatusReady, existing: true, unchanged: true},
+				{cidr: "10.1.0.0/24", name: "missing-root", sitePrefixID: idB,
+					status: cdbm.IPBlockStatusDeleting, existing: true, deleted: true, statusDetails: 1},
+			},
+			wantIPAM: []string{"10.0.0.0/24"},
+		},
 		{
 			name: "operator root name conflict gets a bounded recovered name",
 			existingIPBlocks: []testExistingIPBlock{
@@ -1351,11 +1347,12 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 		},
 		{
 			name: "failed inventory leaves IP Blocks unchanged",
-			previous: []testSitePrefix{
+			existingIPBlocks: []testExistingIPBlock{
 				{
-					id:   idA,
-					cidr: "10.0.0.0/24",
-					name: "core-name",
+					sitePrefixID: idA,
+					createdAgo:   time.Hour,
+					cidr:         "10.0.0.0/24",
+					name:         "core-name",
 				},
 			},
 			reported: []testSitePrefix{
@@ -1366,13 +1363,12 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			failedInventory: true,
 			wantIPBlocks: []testIPBlockState{
 				{
-					cidr:          "10.0.0.0/24",
-					sitePrefixID:  idA,
-					name:          "core-name",
-					status:        cdbm.IPBlockStatusReady,
-					existing:      true,
-					unchanged:     true,
-					statusDetails: 1,
+					cidr:         "10.0.0.0/24",
+					sitePrefixID: idA,
+					name:         "core-name",
+					status:       cdbm.IPBlockStatusReady,
+					existing:     true,
+					unchanged:    true,
 				},
 			},
 			wantIPAM: []string{"10.0.0.0/24"},
@@ -2197,6 +2193,9 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				for _, prefix := range tt.previous {
 					inventory.InventoryPage.ItemIds = append(inventory.InventoryPage.ItemIds, prefix.id)
 				}
+			}
+			if tt.inventoryPage != nil {
+				inventory.InventoryPage = tt.inventoryPage
 			}
 			if tt.omitPageMetadata {
 				inventory.Timestamp = nil
