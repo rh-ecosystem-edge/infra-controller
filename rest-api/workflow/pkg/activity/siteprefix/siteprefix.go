@@ -118,8 +118,18 @@ func (manager ManageSitePrefix) UpdateSitePrefixesInDB(ctx context.Context, site
 		// savepoint so a cleanup failure preserves the Deleting lifecycle.
 		// A failed prefix must not roll back earlier prefixes in the page.
 		id := uuid.MustParse(prefix.GetId().GetValue()) // validated before the transaction
+		existing := existingBlockMap[id]
+		if existing != nil && (existing.SiteID != siteID || existing.InfrastructureProviderID != site.InfrastructureProviderID) {
+			logger.Warn().Str("Site Prefix ID", prefix.GetId().GetValue()).Msg("skipping SitePrefix linked to another Site or Provider")
+			continue
+		}
 		reconciledBlock, err := cdb.WithTxResult(ctx, manager.dbSession, func(tx *cdb.Tx) (*cdbm.IPBlock, error) {
-			err := tx.TryAcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(site.InfrastructureProviderID, siteID), nil)
+			// Never hold a Site-wide lock while waiting for an in-flight Core call.
+			err := tx.AcquireAdvisoryLock(ctx, cdbm.SitePrefixIPBlockLockID(siteID, id), false)
+			if err != nil {
+				return nil, err
+			}
+			err = tx.TryAcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(site.InfrastructureProviderID, siteID), nil)
 			if err != nil {
 				return nil, err
 			}
@@ -191,9 +201,9 @@ func (manager ManageSitePrefix) UpdateSitePrefixesInDB(ctx context.Context, site
 			return block, nil
 		})
 		if err != nil {
-			if isSiteFabricLockContention(err) {
+			if isSitePrefixLockContention(err) {
 				logger.Warn().Err(err).Str("Site Prefix ID", prefix.GetId().GetValue()).
-					Msg("skipping SitePrefix after bounded Site fabric lock contention retries")
+					Msg("skipping SitePrefix due to mutation or Site fabric lock contention")
 				continue
 			}
 			var applicationErr *temporal.ApplicationError
@@ -244,7 +254,12 @@ func (manager ManageSitePrefix) reconcileAbsence(ctx context.Context, site *cdbm
 			return ctx.Err()
 		}
 		err = cdb.WithTx(ctx, manager.dbSession, func(tx *cdb.Tx) error {
-			err := tx.TryAcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(site.InfrastructureProviderID, site.ID), nil)
+			// Absence must follow the same lock order as reported prefixes.
+			err := tx.AcquireAdvisoryLock(ctx, cdbm.SitePrefixIPBlockLockID(site.ID, *candidate.SitePrefixID), false)
+			if err != nil {
+				return err
+			}
+			err = tx.TryAcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(site.InfrastructureProviderID, site.ID), nil)
 			if err != nil {
 				return err
 			}
@@ -282,9 +297,9 @@ func (manager ManageSitePrefix) reconcileAbsence(ctx context.Context, site *cdbm
 			return nil
 		})
 		if err != nil {
-			if isSiteFabricLockContention(err) {
+			if isSitePrefixLockContention(err) {
 				logger.Warn().Err(err).Str("IP Block ID", candidate.ID.String()).
-					Msg("skipping missing SitePrefix after bounded Site fabric lock contention retries")
+					Msg("skipping missing SitePrefix due to mutation or Site fabric lock contention")
 				continue
 			}
 			logger.Error().Err(err).Str("IP Block ID", candidate.ID.String()).Msg("failed to reconcile missing SitePrefix")
@@ -293,7 +308,7 @@ func (manager ManageSitePrefix) reconcileAbsence(ctx context.Context, site *cdbm
 	return ctx.Err()
 }
 
-func isSiteFabricLockContention(err error) bool {
+func isSitePrefixLockContention(err error) bool {
 	// The retry aggregate includes earlier failures; classify its last attempt.
 	lastErr := errors.Unwrap(err)
 	if lastErr == nil {

@@ -186,6 +186,8 @@ const (
 	// testAllocationWaiting creates an Allocation's child IP Block while the
 	// inventory holds the Site row and waits for the Allocation's root.
 	testAllocationWaiting
+	// testForeignTenantMutation holds a tenant row from another Site.
+	testForeignTenantMutation
 )
 
 type testFixture struct {
@@ -483,6 +485,29 @@ func (f testFixture) runWithSiteDeletionBetweenPrefixes(t *testing.T, inventory 
 	return err
 }
 
+// runWithForeignTenantMutation holds a foreign tenant row while the reporting
+// Site receives its ID. Ownership rejection must precede Site-wide locks.
+func (f testFixture) runWithForeignTenantMutation(t *testing.T, inventory *corev1.SitePrefixInventory) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	block := f.linkedBlock(t, inventory.SitePrefixes[0].GetId().GetValue())
+	tx, err := cdb.BeginTx(ctx, f.session, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	require.NoError(t, tx.AcquireAdvisoryLock(ctx, cdbm.SitePrefixIPBlockLockID(block.SiteID, *block.SitePrefixID), false))
+	_, err = cdbm.NewIPBlockDAO(f.session).GetByIDForUpdate(ctx, tx, block.ID)
+	require.NoError(t, err)
+	hook := &testLockAttemptHook{lockID: cdbm.SiteFabricIPBlockLockID(f.site.InfrastructureProviderID, f.site.ID)}
+	f.session.DB.AddQueryHook(hook)
+	err = f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, inventory)
+	if err != nil {
+		return err
+	}
+	require.Zero(t, hook.attempts, "foreign ownership must be rejected before Site fabric locking")
+	return nil
+}
+
 // runWithAllocationWaiting locks the first reported root for an Allocation and
 // waits for the inventory to queue behind it while holding the Site row. The
 // Allocation's child IP Block still has to pass its Site foreign key check.
@@ -549,17 +574,19 @@ func (hook *testSitePrefixLookupHook) BeforeQuery(ctx context.Context, event *bu
 
 func (*testSitePrefixLookupHook) AfterQuery(context.Context, *bun.QueryEvent) {}
 
-// testLockAttemptHook cancels every Site fabric lock attempt after failAfter.
+// testLockAttemptHook cancels attempts for the selected lock after failAfter.
 type testLockAttemptHook struct {
+	lockID    uint64
+	completed int
 	failAfter int
 	attempts  int
 	// beforeFirstAttempt interleaves another inventory after the page snapshot,
-	// before the outer transaction acquires the Site fabric lock.
+	// before the outer transaction acquires the prefix lock.
 	beforeFirstAttempt func()
 }
 
 func (hook *testLockAttemptHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
-	if !strings.Contains(event.Query, "pg_try_advisory_xact_lock") {
+	if !strings.Contains(event.Query, fmt.Sprintf("pg_try_advisory_xact_lock(%d)", hook.lockID)) {
 		return ctx
 	}
 	hook.attempts++
@@ -574,7 +601,11 @@ func (hook *testLockAttemptHook) BeforeQuery(ctx context.Context, event *bun.Que
 	return ctx
 }
 
-func (*testLockAttemptHook) AfterQuery(context.Context, *bun.QueryEvent) {}
+func (hook *testLockAttemptHook) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	if strings.Contains(event.Query, fmt.Sprintf("pg_try_advisory_xact_lock(%d)", hook.lockID)) && event.Err == nil {
+		hook.completed++
+	}
+}
 
 // testSiteDeletionHook deletes the Site when the second prefix locks it.
 type testSiteDeletionHook struct {
@@ -762,6 +793,38 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				require.Equal(t, cdbm.IPBlockStatusDeleting, retired.Status)
 				require.NotNil(t, retired.Deleted)
 			}},
+			{"absence sweep skips in-flight mutations and retires other roots", func(t *testing.T, f testFixture) {
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				prefixID, otherID := uuid.New(), uuid.New()
+				f.createExistingIPBlocks(t, []testExistingIPBlock{
+					{cidr: "10.0.0.0/24", name: "in-flight", sitePrefixID: prefixID.String(), tenantOrg: "tenant", status: cdbm.IPBlockStatusDeleting, createdAgo: time.Hour},
+					{cidr: "10.1.0.0/24", name: "unrelated", sitePrefixID: otherID.String(), tenantOrg: "tenant", status: cdbm.IPBlockStatusDeleting, createdAgo: time.Hour},
+				})
+				block, err := f.blockByPrefixID(ctx, prefixID)
+				require.NoError(t, err)
+				tx, err := cdb.BeginTx(ctx, f.session, nil)
+				require.NoError(t, err)
+				defer func() { _ = tx.Rollback() }()
+				require.NoError(t, tx.AcquireAdvisoryLock(ctx, cdbm.SitePrefixIPBlockLockID(f.site.ID, prefixID), false))
+				_, err = cdbm.NewIPBlockDAO(f.session).GetByIDForUpdate(ctx, tx, block.ID)
+				require.NoError(t, err)
+				hook := &testLockAttemptHook{lockID: cdbm.SiteFabricIPBlockLockID(f.site.InfrastructureProviderID, f.site.ID)}
+				f.session.DB.AddQueryHook(hook)
+				require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, testSitePrefixInventory(nil)))
+				require.Equal(t, 1, hook.attempts, "only the unrelated prefix may acquire the Site fabric lock")
+				retained, err := f.blockByPrefixID(ctx, prefixID)
+				require.NoError(t, err)
+				require.Equal(t, block, retained)
+				retired, err := f.blockByPrefixID(ctx, otherID)
+				require.NoError(t, err)
+				require.NotNil(t, retired.Deleted)
+				require.NoError(t, tx.Commit())
+				require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, testSitePrefixInventory(nil)))
+				retired, err = f.blockByPrefixID(ctx, prefixID)
+				require.NoError(t, err)
+				require.NotNil(t, retired.Deleted)
+			}},
 			{"tenant-created IP Block deletion committed after the page snapshot survives delayed Ready", func(t *testing.T, f testFixture) {
 				ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				defer cancel()
@@ -771,7 +834,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				}
 				inventory := testSitePrefixInventory([]testSitePrefix{prefix})
 				var deleting cdbm.IPBlock
-				f.session.DB.AddQueryHook(&testLockAttemptHook{beforeFirstAttempt: func() {
+				f.session.DB.AddQueryHook(&testLockAttemptHook{lockID: cdbm.SitePrefixIPBlockLockID(f.site.ID, uuid.MustParse(prefix.id)), beforeFirstAttempt: func() {
 					prefix.state = corev1.SitePrefixLifecycleState_SITE_PREFIX_LIFECYCLE_STATE_DELETING
 					require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, testSitePrefixInventory([]testSitePrefix{prefix})))
 					deleting = f.blocks(t)[0]
@@ -938,7 +1001,7 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				replacement := testPrefix()
 				var before *cdbm.IPBlock
 				var detailsBefore []cdbm.StatusDetail
-				f.session.DB.AddQueryHook(&testLockAttemptHook{beforeFirstAttempt: func() {
+				f.session.DB.AddQueryHook(&testLockAttemptHook{lockID: cdbm.SitePrefixIPBlockLockID(f.site.ID, *root.SitePrefixID), beforeFirstAttempt: func() {
 					require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, testSitePrefixInventory(nil)))
 					if tc.adopt {
 						require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, testInventory(replacement)))
@@ -2318,11 +2381,14 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = tx.Rollback() }()
 			require.NoError(t, tx.AcquireAdvisoryLock(ctx, cdbm.SiteFabricIPBlockLockID(f.site.InfrastructureProviderID, f.site.ID), false))
-			hook := &testLockAttemptHook{failAfter: tt.failAfter}
+			hook := &testLockAttemptHook{lockID: cdbm.SiteFabricIPBlockLockID(f.site.InfrastructureProviderID, f.site.ID), failAfter: tt.failAfter}
 			f.session.DB.AddQueryHook(hook)
 
 			require.NoError(t, f.manager.UpdateSitePrefixesInDB(ctx, f.site.ID, inventory))
-			require.Positive(t, hook.attempts)
+			require.Positive(t, hook.completed, "a Site fabric lock attempt must complete before failure injection")
+			if tt.failAfter > 0 {
+				require.Greater(t, hook.attempts, hook.completed)
+			}
 			require.Equal(t, before, f.blocks(t))
 			require.Equal(t, beforeIPAM, f.ipamCIDRs(t, cdbm.IPBlockRoutingTypeDatacenterOnly))
 			for _, level := range []string{"warn", "error"} {
@@ -2356,6 +2422,40 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 		wantIPAM         []string
 		wantSiteDeleted  bool
 	}{
+		{
+			name: "foreign tenant mutation does not block misreported inventory",
+			existingIPBlocks: []testExistingIPBlock{
+				{
+					cidr:         "10.0.0.0/24",
+					name:         "tenant-root",
+					sitePrefixID: idA,
+					tenantOrg:    "tenant",
+					otherSite:    true,
+				},
+			},
+			reported: []testSitePrefix{
+				{
+					id:            idA,
+					cidr:          "10.0.0.0/24",
+					name:          "core-name",
+					tenantManaged: true,
+					tenantOrg:     "tenant",
+				},
+			},
+			writer: testForeignTenantMutation,
+			wantIPBlocks: []testIPBlockState{
+				{
+					cidr:         "10.0.0.0/24",
+					name:         "tenant-root",
+					sitePrefixID: idA,
+					tenantOrg:    "tenant",
+					otherSite:    true,
+					status:       cdbm.IPBlockStatusReady,
+					existing:     true,
+					unchanged:    true,
+				},
+			},
+		},
 		{
 			name: "Site deletion that commits while the inventory waits stops reconciliation",
 			reported: []testSitePrefix{
@@ -2470,6 +2570,8 @@ func TestManageSitePrefix_UpdateSitePrefixesInDB(t *testing.T) {
 				err = f.runWithSiteDeletionWaiting(t, inventory)
 			case testSiteDeletionBetweenPrefixes:
 				err = f.runWithSiteDeletionBetweenPrefixes(t, inventory)
+			case testForeignTenantMutation:
+				err = f.runWithForeignTenantMutation(t, inventory)
 			case testAllocationWaiting:
 				err = f.runWithAllocationWaiting(t, inventory)
 			}
