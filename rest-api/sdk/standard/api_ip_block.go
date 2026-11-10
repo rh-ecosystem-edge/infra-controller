@@ -50,7 +50,7 @@ Only Infrastructure Providers can create a root IP Block. User must have authori
 
 Tenant IP Blocks are created via Allocation.
 
-A conflicting name or address range returns 409. A range conflicts when it overlaps any root IP Block of the Site, whatever its routing type. Creation also returns 409 when another Site fabric IP Block update holds the shared Site lock, including another create, SitePrefix inventory, or legacy Site Config import. Retry the request.
+A conflicting name or address range returns 409. A range conflicts when it overlaps any root IP Block of the Site, whatever its routing type. Concurrent changes to Site fabric IP Blocks can also return 409. Retry the request.
 
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org
@@ -193,9 +193,9 @@ DeleteIpblock Delete IP Block
 
 Org must have an Infrastructure Provider entity. User must have authorization role with `PROVIDER_ADMIN` suffix. Only root IP Blocks can be deleted if there are no allocations associated with them.
 
-For a root linked to an `OperatorManaged` SitePrefix, remove its prefix from Core's `site_fabric_prefixes` configuration. SitePrefix inventory retires the root after existing Allocations drain. An unlinked root can be deleted through this endpoint once no Allocations use it.
+For an automatically managed Site fabric IP Block, remove its address range from the Site configuration. The IP Block is removed after existing Allocations drain. If the block loses its association with the Site configuration while Allocations remain, delete it through this endpoint after those Allocations drain.
 
-Tenant IP Blocks are managed via Allocation. Unknown IDs, IP Blocks belonging to another Infrastructure Provider, and Tenant-created IP Blocks (`managed: false`) return 404. A Site fabric root linked to an `OperatorManaged` SitePrefix cannot be deleted through this endpoint and returns 409.
+Tenant IP Blocks are managed via Allocation. Unknown IDs, IP Blocks belonging to another Infrastructure Provider, and Tenant-created IP Blocks (`managed: false`) return 404. A Site fabric IP Block managed by the Site configuration cannot be deleted through this endpoint and returns 409.
 
 	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
 	@param org Name of the Org
@@ -948,7 +948,7 @@ UpdateIpblock Update IP Block
 
 Org must have an Infrastructure Provider. Specified IP Block must belong to the Provider and requesting user must have `PROVIDER_ADMIN` role. Only root IP Blocks can be patched.
 
-REST preserves the name and description of a Site fabric root across inventory updates. Renaming it does not prevent retirement when Core reports its linked SitePrefix as `Deleting`.
+The name and description of a Site fabric IP Block are preserved across Site updates. Renaming it does not prevent automatic deletion when its configured address range is removed.
 
 Tenant IP Blocks are managed via Allocation. Unknown IDs, IP Blocks belonging to another Infrastructure Provider, and Tenant-created IP Blocks (`managed: false`) return 404.
 

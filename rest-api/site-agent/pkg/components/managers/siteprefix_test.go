@@ -71,7 +71,7 @@ func TestSitePrefix_RegisterPublisher(t *testing.T) {
 			require.Equal(t, "DiscoverSitePrefixInventory", temporalFunctionName(recorder.workflow))
 			require.Equal(t, "DiscoverSitePrefixInventory", temporalFunctionName(recorder.activity))
 			subscriber.AssertExpectations(t)
-			if tc.startErr != nil {
+			if tc.startErr != nil || tc.schedule != "" {
 				return
 			}
 
