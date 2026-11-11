@@ -378,6 +378,13 @@ fn clean_pandoc_markdown(md: &str) -> String {
         let had_hard_break = line.ends_with("  ");
         let line = line.trim_end_matches(' ');
         let line = line.strip_suffix('\\').unwrap_or(line);
+        let line = if section.eq_ignore_ascii_case("OPTIONS")
+            && line == "Print help (see a summary with '-h')"
+        {
+            "Print help (see a summary with `-h`)"
+        } else {
+            line
+        };
         if line.is_empty() {
             out.push('\n');
         } else {
@@ -621,29 +628,43 @@ mod tests {
     #[ignore = "requires pandoc on PATH"]
     fn man_conversion_preserves_apostrophes() {
         let dir = tempfile::tempdir().unwrap();
-        let command = clap::Command::new("apostrophes")
-            .about("Inspect the server's profiles and the tenant's choices.");
-        clap_mangen::generate_to(command, dir.path()).unwrap();
-        let path = dir.path().join("apostrophes.1");
+        let mut root = clap::Command::new(BIN).subcommand(
+            clap::Command::new("apostrophes")
+                .about("Inspect profiles and choices.")
+                .long_about("Inspect the server's profiles and the tenant's choices."),
+        );
+        root.build();
+        clap_mangen::generate_to(root.clone(), dir.path()).unwrap();
+        let command = root.find_subcommand("apostrophes").unwrap();
+        let path = dir.path().join(format!("{BIN}-apostrophes.1"));
         let original = std::fs::read_to_string(&path).unwrap();
 
         value_scenarios!(run = |prefix: &str| {
             let man = format!("{prefix}{original}");
             std::fs::write(&path, &man).unwrap();
 
-            let markdown = super::man_to_markdown(&path).unwrap();
+            super::render_node(
+                command,
+                vec![BIN.to_string(), "apostrophes".to_string()],
+                super::CliDomain::Admin,
+                dir.path(),
+                dir.path(),
+            )
+            .unwrap();
+            let markdown = std::fs::read_to_string(dir.path().join("apostrophes.md")).unwrap();
 
             assert_eq!(std::fs::read_to_string(&path).unwrap(), man);
             (
                 markdown.contains("server's profiles"),
                 markdown.contains("tenant's choices"),
+                markdown.contains("Print help (see a summary with `-h`)"),
             )
         };
             "generated preamble" {
-                "" => (true, true),
+                "" => (true, true, true),
             }
             "comment before generated preamble" {
-                ".\\\" Generated documentation\n" => (true, true),
+                ".\\\" Generated documentation\n" => (true, true, true),
             }
         );
     }
@@ -671,6 +692,16 @@ mod tests {
                 "(https://github.com/dsx-ai-factory/infra-controller/issues/6686)" =>
                     "([issue #6686](https://github.com/dsx-ai-factory/infra-controller/issues/6686))".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn default_help_option_is_formatted_as_code() {
+        let markdown = "## OPTIONS\n\nPrint help (see a summary with '-h')\n\nKeep the server's '-h' setting.\n";
+
+        assert_eq!(
+            clean_pandoc_markdown(markdown),
+            "## OPTIONS\n\nPrint help (see a summary with `-h`)\n\nKeep the server's '-h' setting.\n"
         );
     }
 
