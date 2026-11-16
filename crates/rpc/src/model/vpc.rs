@@ -22,8 +22,8 @@ use config_version::ConfigVersion;
 use model::metadata::{LabelFilter, Metadata};
 use model::vpc::{
     ChangeVpcRoutingProfile, NewVpc, PowerResourceGroupUpdate, PrefixFilterPolicyEntry,
-    RouteTargetConfig, UpdateVpc, UpdateVpcVirtualization, Vpc, VpcPeering,
-    VpcRoutingProfileOverrides, VpcSearchFilter, VpcStatus,
+    PrefixRouteTargetConfig, RouteTargetConfig, UpdateVpc, UpdateVpcVirtualization, Vpc,
+    VpcPeering, VpcRoutingProfileOverrides, VpcSearchFilter, VpcStatus,
 };
 
 use crate as rpc;
@@ -100,31 +100,115 @@ impl From<VpcStatus> for rpc::forge::VpcStatus {
     }
 }
 
+impl TryFrom<rpc::common::RouteTarget> for RouteTargetConfig {
+    type Error = RpcDataConversionError;
+
+    fn try_from(target: rpc::common::RouteTarget) -> Result<Self, Self::Error> {
+        let target = RouteTargetConfig {
+            asn: target.asn,
+            vni: target.vni,
+            vni_self: target.vni_self,
+        };
+        target
+            .validate()
+            .map_err(|error| RpcDataConversionError::InvalidArgument(error.to_string()))?;
+        Ok(target)
+    }
+}
+
+impl From<RouteTargetConfig> for rpc::common::RouteTarget {
+    fn from(target: RouteTargetConfig) -> Self {
+        Self {
+            asn: target.asn,
+            vni: target.vni,
+            vni_self: target.vni_self,
+        }
+    }
+}
+
+impl TryFrom<rpc::forge::PrefixRouteTarget> for PrefixRouteTargetConfig {
+    type Error = RpcDataConversionError;
+
+    /// Validates one wire rule before its symbolic targets can be persisted.
+    fn try_from(entry: rpc::forge::PrefixRouteTarget) -> Result<Self, Self::Error> {
+        // Reject unknown enum values before they can acquire the default GE meaning.
+        let match_type = rpc::forge::ExportPrefixMatchType::try_from(entry.match_type)
+            .map_err(|error| RpcDataConversionError::InvalidArgument(error.to_string()))?;
+        let entry = Self {
+            prefix: entry
+                .prefix
+                .parse::<carbide_network::ip::prefix::IpNet>()
+                .map_err(|error| RpcDataConversionError::InvalidArgument(error.to_string()))?
+                .trunc(),
+            match_type: match_type.into(),
+            max_prefix_length: entry.max_prefix_length,
+            route_targets: entry
+                .route_targets
+                .into_iter()
+                .map(RouteTargetConfig::try_from)
+                .collect::<Result<_, _>>()?,
+        };
+        entry
+            .validate()
+            .map_err(|error| RpcDataConversionError::InvalidArgument(error.to_string()))?;
+        Ok(entry)
+    }
+}
+
+impl From<PrefixRouteTargetConfig> for rpc::forge::PrefixRouteTarget {
+    /// Canonicalizes the prefix while preserving symbolic targets in configuration responses.
+    fn from(entry: PrefixRouteTargetConfig) -> Self {
+        Self {
+            prefix: entry.prefix.trunc().to_string(),
+            match_type: rpc::forge::ExportPrefixMatchType::from(entry.match_type) as i32,
+            max_prefix_length: entry.max_prefix_length,
+            route_targets: entry.route_targets.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 impl TryFrom<rpc::forge::VpcRoutingProfileOverrides> for VpcRoutingProfileOverrides {
     type Error = RpcDataConversionError;
 
     fn try_from(profile: rpc::forge::VpcRoutingProfileOverrides) -> Result<Self, Self::Error> {
+        let route_targets_on_exports_by_prefix = profile
+            .route_targets_on_exports_by_prefix
+            .map(|entries| {
+                entries
+                    .values
+                    .into_iter()
+                    .map(PrefixRouteTargetConfig::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        PrefixRouteTargetConfig::validate_entries(
+            route_targets_on_exports_by_prefix
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .map_err(|error| RpcDataConversionError::InvalidArgument(error.to_string()))?;
         Ok(Self {
-            route_target_imports: profile.route_target_imports.map(|targets| {
-                targets
-                    .values
-                    .into_iter()
-                    .map(|target| RouteTargetConfig {
-                        asn: target.asn,
-                        vni: target.vni,
-                    })
-                    .collect()
-            }),
-            route_targets_on_exports: profile.route_targets_on_exports.map(|targets| {
-                targets
-                    .values
-                    .into_iter()
-                    .map(|target| RouteTargetConfig {
-                        asn: target.asn,
-                        vni: target.vni,
-                    })
-                    .collect()
-            }),
+            route_targets_on_exports_by_prefix,
+            route_target_imports: profile
+                .route_target_imports
+                .map(|targets| {
+                    targets
+                        .values
+                        .into_iter()
+                        .map(RouteTargetConfig::try_from)
+                        .collect()
+                })
+                .transpose()?,
+            route_targets_on_exports: profile
+                .route_targets_on_exports
+                .map(|targets| {
+                    targets
+                        .values
+                        .into_iter()
+                        .map(RouteTargetConfig::try_from)
+                        .collect()
+                })
+                .transpose()?,
             leak_default_route_from_underlay: profile.leak_default_route_from_underlay,
             leak_tenant_host_routes_to_underlay: profile.leak_tenant_host_routes_to_underlay,
             tenant_leak_communities_accepted: profile.tenant_leak_communities_accepted,
@@ -163,14 +247,16 @@ impl TryFrom<rpc::forge::VpcRoutingProfileOverrides> for VpcRoutingProfileOverri
 impl From<VpcRoutingProfileOverrides> for rpc::forge::VpcRoutingProfileOverrides {
     fn from(profile: VpcRoutingProfileOverrides) -> Self {
         Self {
+            route_targets_on_exports_by_prefix: profile.route_targets_on_exports_by_prefix.map(
+                |entries| rpc::forge::PrefixRouteTargets {
+                    values: entries.into_iter().map(Into::into).collect(),
+                },
+            ),
             route_target_imports: profile.route_target_imports.map(|targets| {
                 rpc::common::RouteTargets {
                     values: targets
                         .into_iter()
-                        .map(|target| rpc::common::RouteTarget {
-                            asn: target.asn,
-                            vni: target.vni,
-                        })
+                        .map(rpc::common::RouteTarget::from)
                         .collect(),
                 }
             }),
@@ -178,10 +264,7 @@ impl From<VpcRoutingProfileOverrides> for rpc::forge::VpcRoutingProfileOverrides
                 rpc::common::RouteTargets {
                     values: targets
                         .into_iter()
-                        .map(|target| rpc::common::RouteTarget {
-                            asn: target.asn,
-                            vni: target.vni,
-                        })
+                        .map(rpc::common::RouteTarget::from)
                         .collect(),
                 }
             }),
@@ -424,11 +507,249 @@ impl From<VpcPeering> for rpc::forge::VpcPeering {
 #[cfg(test)]
 mod tests {
     use carbide_network::virtualization::VpcVirtualizationType;
-    use carbide_test_support::value_scenarios;
+    use carbide_test_support::Outcome::FailsWith;
+    use carbide_test_support::{scenarios, value_scenarios};
     use carbide_uuid::vpc::VpcId;
     use model::vpc::VpcConfig;
+    use prost::Message;
 
     use super::*;
+
+    /// Verifies current and predecessor route-target schemas preserve nonzero
+    /// and literal-zero values so mixed-version deployments remain compatible.
+    #[test]
+    fn route_target_wire_remains_compatible_with_predecessor_schema() {
+        /// Models the predecessor agent's scalar field 2 to exercise its actual
+        /// protobuf decoding behavior.
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyRouteTarget {
+            #[prost(uint32, tag = "1")]
+            asn: u32,
+            #[prost(uint32, tag = "2")]
+            vni: u32,
+        }
+
+        let cases = [
+            // A nonzero optional value must retain the predecessor's scalar value.
+            (
+                "nonzero local administrator",
+                rpc::common::RouteTarget {
+                    asn: 64_512,
+                    vni: Some(73),
+                    vni_self: false,
+                },
+                73,
+            ),
+            // An explicitly present zero must retain field 2 on the wire.
+            (
+                "explicit zero local administrator",
+                rpc::common::RouteTarget {
+                    asn: 64_513,
+                    vni: Some(0), // Qualifies explicit-zero presence on the current side.
+                    vni_self: false,
+                },
+                0,
+            ),
+        ];
+
+        for (scenario, target, expected_vni) in cases {
+            // Encode with current Core and decode with the predecessor agent type.
+            let encoded = target.encode_to_vec();
+            if expected_vni == 0 {
+                assert!(
+                    encoded.ends_with(&[0x10, 0x00]),
+                    "{scenario}: optional field 2 was not encoded"
+                );
+            }
+            let legacy =
+                LegacyRouteTarget::decode(encoded.as_slice()).expect("legacy agent must decode");
+
+            // Preserve both components for predecessor agents.
+            assert_eq!(legacy.asn, target.asn, "{scenario}");
+            assert_eq!(legacy.vni, expected_vni, "{scenario}");
+        }
+
+        // Encode predecessor literal zero, which proto3 omits from the wire.
+        let predecessor_zero = LegacyRouteTarget {
+            asn: 64_514,
+            vni: 0,
+        }
+        .encode_to_vec();
+
+        // Decode the predecessor bytes with the current optional-field schema.
+        let current = rpc::common::RouteTarget::decode(predecessor_zero.as_slice())
+            .expect("current Core must decode predecessor route targets");
+
+        // Current protobuf decoding must observe the predecessor's omitted field.
+        assert_eq!(current.vni, None);
+
+        // Convert and resolve through the same Core model path used by VPC requests.
+        let resolved = RouteTargetConfig::try_from(current)
+            .expect("predecessor literal zero must remain valid")
+            .resolve(None)
+            .expect("legacy omission must resolve without a VPC VNI");
+
+        // Predecessor scalar omission must retain literal-zero meaning.
+        assert_eq!(
+            resolved,
+            RouteTargetConfig {
+                asn: 64_514,
+                vni: Some(0),
+                vni_self: false,
+            }
+        );
+    }
+
+    /// Verifies protobuf defaults, normalized prefixes, and nested validation preserve the export contract.
+    #[test]
+    fn conditional_export_rpc_rejects_invalid_entries_and_preserves_presence() {
+        use carbide_test_support::Outcome::Fails;
+
+        // Omit match_type to exercise protobuf's GE default with a symbolic target.
+        let rule = rpc::forge::PrefixRouteTarget {
+            prefix: "192.0.2.7/24".into(), // Host bits must not survive conversion.
+            route_targets: vec![rpc::common::RouteTarget {
+                asn: 64512,
+                vni: None,
+                vni_self: true,
+            }],
+            ..Default::default()
+        };
+        let overrides = rpc::forge::VpcRoutingProfileOverrides {
+            route_targets_on_exports_by_prefix: Some(rpc::forge::PrefixRouteTargets {
+                values: vec![rule.clone()],
+            }),
+            ..Default::default()
+        };
+        // Stored definitions retain symbols while canonicalizing the matched network.
+        let decoded = VpcRoutingProfileOverrides::try_from(overrides).expect("valid symbolic rule");
+        let encoded = rpc::forge::VpcRoutingProfileOverrides::from(decoded);
+        let retained = &encoded
+            .route_targets_on_exports_by_prefix
+            .expect("present rules")
+            .values[0];
+        assert_eq!(retained.prefix, "192.0.2.0/24");
+        assert_eq!(
+            retained.match_type,
+            rpc::forge::ExportPrefixMatchType::Ge as i32
+        );
+        assert_eq!(retained.route_targets, rule.route_targets);
+
+        // Supply an explicit zero maximum on a valid LE default-route rule.
+        let mut zero_maximum = rule.clone();
+        zero_maximum.prefix = "0.0.0.0/0".into();
+        zero_maximum.match_type = rpc::forge::ExportPrefixMatchType::Le as i32;
+        zero_maximum.max_prefix_length = Some(0);
+        let preserved = rpc::forge::PrefixRouteTarget::from(
+            PrefixRouteTargetConfig::try_from(zero_maximum).expect("valid zero maximum"),
+        );
+        // Preserve zero rather than omitting the bound and selecting every contained IPv4 prefix.
+        assert_eq!(preserved.max_prefix_length, Some(0));
+
+        // Keep invalid wire values separate from valid JSON enum names tested by the shared type.
+        let mut unknown_match = rule.clone();
+        unknown_match.match_type = 99; // Prost retains unknown enum integers.
+        let mut empty_targets = rule.clone();
+        empty_targets.route_targets.clear(); // Proto3 omission and empty arrays have the same value.
+        let mut conflicting_target = rule;
+        conflicting_target.route_targets[0].vni = Some(0); // Explicit zero still conflicts with vni_self.
+        carbide_test_support::scenarios!(run = |entry| {
+            PrefixRouteTargetConfig::try_from(entry).map(drop).map_err(drop)
+        };
+            "invalid conditional wire rules" {
+                // Unknown wire integers must fail instead of using GE.
+                unknown_match => Fails,
+                // Empty repeated fields must fail even when protobuf omitted the field.
+                empty_targets => Fails,
+                // Nested values must use the same RT validation as top-level targets.
+                conflicting_target => Fails,
+            }
+        );
+
+        // Round-trip omitted and explicitly empty override lists without collapsing inheritance.
+        carbide_test_support::value_scenarios!(run = |conditional: Option<rpc::forge::PrefixRouteTargets>| {
+            let overrides = rpc::forge::VpcRoutingProfileOverrides {
+                route_targets_on_exports_by_prefix: conditional.clone(),
+                ..Default::default()
+            };
+            let stored = VpcRoutingProfileOverrides::try_from(overrides).expect("valid override");
+            rpc::forge::VpcRoutingProfileOverrides::from(stored).route_targets_on_exports_by_prefix
+                == conditional
+        };
+            "presence-aware conditional export lists" {
+                // Omission must retain inheritance rather than select an empty policy.
+                None => true,
+                // A present empty list must remain an explicit inherited-policy clearing.
+                Some(rpc::forge::PrefixRouteTargets { values: vec![] }) => true,
+            }
+        );
+    }
+
+    /// Verifies both RPC override directions reject a distinct invalid
+    /// route-target contract before malformed policy reaches persistence.
+    /// Conditional exports also reject target lists that exceed the configured-pair limit.
+    #[test]
+    fn vpc_routing_profile_overrides_reject_invalid_route_targets() {
+        scenarios!(run = |profile| {
+            VpcRoutingProfileOverrides::try_from(profile)
+                .map(drop)
+                .map_err(|error| match error {
+                    RpcDataConversionError::InvalidArgument(message) => message,
+                    error => panic!("unexpected route-target conversion error: {error}"),
+                })
+        };
+            "invalid route-target override lists" {
+                // Imports reject competing literal and VPC-derived sources.
+                rpc::forge::VpcRoutingProfileOverrides {
+                    route_target_imports: Some(rpc::common::RouteTargets {
+                        values: vec![rpc::common::RouteTarget {
+                            asn: 64_512,
+                            vni: Some(0), // Presence conflicts even at zero.
+                            vni_self: true,
+                        }],
+                    }),
+                    ..Default::default()
+                } => FailsWith(
+                    "route target cannot specify both vni and vni_self".to_string()
+                ),
+
+                // Exports reject components that fit neither standard encoding.
+                rpc::forge::VpcRoutingProfileOverrides {
+                    route_targets_on_exports: Some(rpc::common::RouteTargets {
+                        values: vec![rpc::common::RouteTarget {
+                            asn: 429_000_000,
+                            vni: Some(65_536),
+                            vni_self: false,
+                        }],
+                    }),
+                    ..Default::default()
+                } => FailsWith(
+                    "route target ASN 429000000 and local administrator 65536 cannot both exceed 65535"
+                        .to_string()
+                ),
+
+                // One prefix cannot bypass the pair limit with many individually valid targets.
+                rpc::forge::VpcRoutingProfileOverrides {
+                    route_targets_on_exports_by_prefix: Some(rpc::forge::PrefixRouteTargets {
+                        values: vec![rpc::forge::PrefixRouteTarget {
+                            prefix: "0.0.0.0/0".to_string(),
+                            route_targets: (0..=256) // One more target than the shared pair limit.
+                                .map(|vni| rpc::common::RouteTarget {
+                                    asn: 64_512,
+                                    vni: Some(vni),
+                                    vni_self: false,
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                } => FailsWith(
+                    "route_targets_on_exports_by_prefix exceeds 256 prefix/route-target pairs".to_string()
+                ),
+            }
+        );
+    }
 
     #[test]
     fn vpc_routing_change_requires_original_version_and_named_destination() {

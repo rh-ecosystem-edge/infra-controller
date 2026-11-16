@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ::rpc::DiscoveryInfo;
-use ::rpc::forge_tls_client::ForgeClientConfig;
+use ::rpc::carbide_tls_client::CarbideClientConfig;
 use ::rpc::machine_discovery::{DmiData, DpuData};
 use carbide_host_support::agent_config::AgentConfig;
 use carbide_host_support::hardware_enumeration::{
@@ -49,11 +49,13 @@ pub mod dpu;
 mod acl_rules;
 pub mod agent_platform;
 mod astra_weave;
+mod astra_xplane;
 mod command_line;
 pub mod containerd;
 mod dhcp;
 mod dhcp_server_grpc_client;
 mod ethernet_virtualization;
+mod xplane_client;
 use carbide_uuid::machine::DpuMachineId;
 pub use ethernet_virtualization::FPath;
 pub mod extension_services;
@@ -77,6 +79,7 @@ pub mod network_monitor;
 pub mod nvue; // pub so that integration tests can read nvue::PATH
 mod ovs;
 mod periodic_config_fetcher;
+mod service_network;
 mod supplemental_config;
 mod sysfs;
 #[cfg(test)]
@@ -86,6 +89,9 @@ pub mod util;
 pub mod weave_ew_vpc_client;
 #[cfg(test)]
 pub mod weave_ew_vpc_mock_server;
+#[cfg(any(test, feature = "xplane-maintenance-mock"))]
+pub mod xplane_mock_server;
+pub use xplane_client::proto as xplane_proto;
 
 /// The minimum version of HBN that FMDS supports
 pub const FMDS_MINIMUM_HBN_VERSION: &str = "1.5.0-doca2.2.0";
@@ -420,8 +426,8 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
         agent.forge_system.client_cert.clone(),
         agent.forge_system.client_key.clone(),
     );
-    let forge_client_config = Arc::new(
-        ForgeClientConfig::new(
+    let carbide_client_config = Arc::new(
+        CarbideClientConfig::new(
             agent.forge_system.root_ca.clone(),
             Some(ClientCert {
                 cert_path: agent.forge_system.client_cert.clone(),
@@ -474,7 +480,7 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                 result = main_loop::setup_and_run(
                     machine_id,
                     factory_mac_address,
-                    forge_client_config,
+                    carbide_client_config,
                     agent,
                     *options,
                 ) => result.wrap_err("main_loop error exit"),
@@ -562,7 +568,7 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                 network_monitor::NetworkMonitor::new(machine_id, None, pinger);
 
             network_monitor
-                .run_onetime(&agent.forge_system.api_server, &forge_client_config)
+                .run_onetime(&agent.forge_system.api_server, &carbide_client_config)
                 .await;
         }
 
@@ -596,7 +602,7 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                     ),
                     machine_id,
                     forge_api: forge_api_server.clone(),
-                    forge_client_config: Arc::clone(&forge_client_config),
+                    carbide_client_config: Arc::clone(&carbide_client_config),
                 },
             )
             .await;
@@ -604,7 +610,7 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
             let host_machine_id = match get_host_machine_id_retry(
                 &agent,
                 &periodic_config_fetcher,
-                Arc::clone(&forge_client_config),
+                Arc::clone(&carbide_client_config),
                 &forge_api_server,
             )
             .await
@@ -643,7 +649,7 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
             // --dhcp-servers 10.217.126.2  # comma separated list
             // --l3-domain 4096,10.0.0.1,svi  # repeat for multiple
             // --ct-external-access 4096  # comma separated list
-            // --ct-port-config '{"interface_name": "if1", "vlan": 123, "vni": 456, "gateway_cidr": "10.0.0.100/32"}' # repeated for multiple
+            // --ct-port-config '{"interface_name": "if1", "vlan": 123, "vni": 456, "gateway_cidrs": ["10.0.0.100/32"]}' # repeated for multiple
             // --hbn_version 1.5.0-doca2.2.0
             WriteTarget::Nvue(opts) => {
                 let mut port_configs = Vec::with_capacity(opts.ct_port_config.len());

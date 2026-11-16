@@ -17,6 +17,8 @@
 
 //! DPF SDK - High-level interface for DPF operations.
 
+mod bmc_credentials;
+mod version;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -24,6 +26,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+pub use bmc_credentials::{
+    BmcCredentialFailureReason, BmcCredentialHealth, BmcCredentialObservation,
+    bmc_credential_secret_name,
+};
 use carbide_utils::none_if_empty::NoneIfEmpty;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
@@ -110,14 +116,14 @@ use crate::types::{
     DetachedDpfResourceObservation, DetachedDpuServiceChainDefinition,
     DetachedDpuServiceDefinition, DetachedDpuServiceInterface,
     DetachedDpuServiceInterfaceDefinition, DpfDeletePreconditions, DpfInterceptBridging,
-    DpuDeploymentType, DpuDeviceInfo, DpuDeviceSummary, DpuMismatch, DpuNodeInfo, DpuNodeSummary,
-    DpuPhase, DpuServiceDaemonSetObservation, DpuServiceHelmChartObservation,
-    DpuServiceInterfacePatch, DpuServiceInterfaceTemplateDefinition,
-    DpuServiceInterfaceTemplateType, DpuServiceObservation, DpuServiceSecurityObservation,
-    DpuServiceVersion, DpuSummary, FMDS_SERVICE_NAME, HostDpfSnapshot, InitDpfResourcesConfig,
-    MAX_BLUEFIELD_VFS_PER_PF, OTEL_COLLECTOR_SERVICE_NAME, PF_TOTAL_SF_BF4_ASTRA_FUDGE,
-    ServiceConfigPortProtocol, ServiceDefinition, ServiceNAD, ServiceNADResourceType,
-    ServiceTemplateVersion,
+    DpuDeploymentType, DpuDeviceInfo, DpuDeviceSummary, DpuFailureObservation, DpuMismatch,
+    DpuNodeInfo, DpuNodeSummary, DpuPhase, DpuPhaseObservation, DpuServiceDaemonSetObservation,
+    DpuServiceHelmChartObservation, DpuServiceInterfacePatch,
+    DpuServiceInterfaceTemplateDefinition, DpuServiceInterfaceTemplateType, DpuServiceObservation,
+    DpuServiceSecurityObservation, DpuServiceVersion, DpuSummary, FMDS_SERVICE_NAME,
+    HostDpfSnapshot, InitDpfResourcesConfig, MAX_BLUEFIELD_VFS_PER_PF, OTEL_COLLECTOR_SERVICE_NAME,
+    PF_TOTAL_SF_BF4_ASTRA_FUDGE, ServiceConfigPortProtocol, ServiceDefinition, ServiceNAD,
+    ServiceNADResourceType, ServiceTemplateVersion,
 };
 #[cfg(test)]
 use crate::types::{DEFAULT_PF_TOTAL_SF_RESERVED, InitDpfResourcesConfigBuilder};
@@ -169,7 +175,9 @@ pub trait ResourceLabeler: Send + Sync {
     }
 
     /// Node selector labels for a specific deployment type.
-    /// Used by [`build_deployment`] to populate `dpuNodeSelector.matchLabels`.
+    /// Used by [`build_deployment`] to populate the deployment-specific part of
+    /// `dpuNodeSelector.matchLabels`. The DPU-capability label is added separately
+    /// as an `Exists` requirement because NFD emits it with an empty value.
     /// Returns `ConfigError` if no deployment is configured for the requested type.
     fn node_labels_for_deployment_type(
         &self,
@@ -216,6 +224,7 @@ pub struct DpfSdk<R, L = NoLabels> {
     repo: Arc<R>,
     namespace: String,
     labeler: L,
+    operator_version: semver::Version,
     shared_bmc_password_ready: Arc<AtomicBool>,
     _bmc_refresh_guard: Option<tokio_util::sync::DropGuard>,
 }
@@ -285,7 +294,7 @@ impl<'a, R, P, L> DpfSdkBuilder<'a, R, P, L> {
 
 impl<R, P, L> DpfSdkBuilder<'_, R, P, L>
 where
-    R: K8sConfigRepository + 'static,
+    R: K8sConfigRepository + DpfOperatorConfigRepository + 'static,
     P: BmcPasswordProvider + 'static,
 {
     /// Fetch password, write the K8s BMC secret, spawn refresh task,
@@ -306,11 +315,15 @@ where
     /// DPUDevice while the replacement replica starts.
     /// Without a refresh interval nothing would ever retry, so there a failed
     /// read stays fatal.
+    ///
+    /// Reads the installed operator version once. A missing operator config or version,
+    /// invalid version, read failure, or expired read deadline fails SDK construction.
     async fn init_secret_and_task(self) -> Result<DpfSdk<R, L>, DpfError> {
         let repo = Arc::new(self.repo);
         let namespace = self.namespace;
         let provider = self.bmc_password_provider;
         let shared_bmc_password_ready = Arc::new(AtomicBool::new(false));
+        let operator_version = version::read_operator_version(repo.as_ref(), &namespace).await?;
 
         let password = match provider.get_bmc_password().await {
             Ok(password) => {
@@ -359,13 +372,14 @@ where
             repo,
             namespace,
             labeler: self.labeler,
+            operator_version,
             shared_bmc_password_ready,
             _bmc_refresh_guard: guard,
         })
     }
 
-    /// Consume the builder, create the K8s BMC secret and optionally
-    /// spawn a background refresh task. Does not create DPF CRDs.
+    /// Consume the builder, create the K8s BMC secret, cache the installed operator version,
+    /// and optionally spawn a background credential refresh task. Does not create DPF CRDs.
     pub async fn build_without_resources(self) -> Result<DpfSdk<R, L>, DpfError> {
         self.init_secret_and_task().await
     }
@@ -896,6 +910,7 @@ async fn create_dpu_flavor_template<R: DpuFlavorTemplateRepository>(
         dhcp_acl_interfaces,
         &config.extra_bfcfg_parameters,
         config.enable_delay_host_init,
+        !config.partial_multiplane_disabled,
     )?;
     let name = template.unique_name(&config.flavor_name)?;
     template.metadata.name = Some(name.clone());
@@ -1123,8 +1138,7 @@ pub fn build_service_configuration(
             deployment_service_name: svc.name.clone(),
             interfaces: interfaces.none_if_empty(),
             service_configuration,
-            // NICo-owned services can update independently; other services wait
-            // for the DPU service sync handler to open the NodeEffect gate.
+            // Service upgrades wait for the NodeEffect gate unless explicitly overridden.
             upgrade_policy: DpuServiceConfigurationUpgradePolicy {
                 apply_node_effect: Some(svc.apply_node_effect.unwrap_or(true)),
             },
@@ -1154,6 +1168,80 @@ pub fn build_service_nad(service_nad: &ServiceNAD, namespace: &str, suffix: &str
         },
         status: None,
     }
+}
+
+/// Creates a service NAD when absent and leaves an existing NAD under its current owner's
+/// control. The bridge, resource type, and IPAM mode must still satisfy the service contract;
+/// a restrictive cluster selector cannot satisfy a service targeting all clusters.
+/// serviceMTU may be site-specific and is deliberately not rewritten or constrained here.
+pub(crate) async fn apply_or_validate_service_nad<R: DpuServiceNADRepository>(
+    repo: &R,
+    desired: &DPUServiceNAD,
+) -> Result<(), DpfError> {
+    let name = desired
+        .metadata
+        .name
+        .as_deref()
+        .ok_or_else(|| DpfError::InvalidState("DPUServiceNAD name is required".to_string()))?;
+    let namespace =
+        desired.metadata.namespace.as_deref().ok_or_else(|| {
+            DpfError::InvalidState("DPUServiceNAD namespace is required".to_string())
+        })?;
+
+    if let Some(existing) = repo.get(name, namespace).await? {
+        let same_resource_type = matches!(
+            (&existing.spec.resource_type, &desired.spec.resource_type),
+            (DpuServiceNadResourceType::Sf, DpuServiceNadResourceType::Sf)
+                | (DpuServiceNadResourceType::Vf, DpuServiceNadResourceType::Vf)
+                | (
+                    DpuServiceNadResourceType::Veth,
+                    DpuServiceNadResourceType::Veth
+                )
+        );
+        let compatible = existing.spec.bridge == desired.spec.bridge
+            && existing.spec.ipam.unwrap_or(false) == desired.spec.ipam.unwrap_or(false)
+            && same_resource_type;
+        if !compatible {
+            return Err(DpfError::InvalidState(format!(
+                "existing DPUServiceNAD {namespace}/{name} has incompatible bridge, resource type, or IPAM settings; resolve it before NICo initializes DPF services"
+            )));
+        }
+
+        if desired.spec.dpu_cluster_selector.is_none()
+            && existing
+                .spec
+                .dpu_cluster_selector
+                .as_ref()
+                .is_some_and(|selector| {
+                    selector
+                        .match_labels
+                        .as_ref()
+                        .is_some_and(|labels| !labels.is_empty())
+                        || selector
+                            .match_expressions
+                            .as_ref()
+                            .is_some_and(|expressions| !expressions.is_empty())
+                })
+        {
+            return Err(DpfError::InvalidState(format!(
+                "existing DPUServiceNAD {namespace}/{name} has a restrictive DPU cluster selector; NICo targets all clusters, so use an unscoped NAD or a different name"
+            )));
+        }
+
+        if existing.spec.service_mtu != desired.spec.service_mtu {
+            tracing::warn!(
+                namespace,
+                name,
+                existing_mtu = ?existing.spec.service_mtu,
+                desired_mtu = ?desired.spec.service_mtu,
+                "Preserving the existing DPUServiceNAD MTU; validate it for this site"
+            );
+        }
+        return Ok(());
+    }
+
+    repo.apply(desired).await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1238,10 +1326,13 @@ pub fn build_deployment(
             });
         }
 
-        all_switches.push(DpuDeploymentServiceChainsSwitches {
-            ports,
-            service_mtu: None,
-        });
+        // Preserve DPF's default for ordinary chains while fixed service-VPC patches carry their
+        // qualified jumbo MTU explicitly.
+        let service_mtu = match &iface.iface_type {
+            DpuServiceInterfaceTemplateType::Patch(patch) => patch.service_mtu,
+            _ => None,
+        };
+        all_switches.push(DpuDeploymentServiceChainsSwitches { ports, service_mtu });
     }
     if matches!(deployment_type, DpuDeploymentType::Bf4Astra) {
         all_switches.extend(build_astra_patch_service_chain_switches(interfaces));
@@ -1260,9 +1351,7 @@ pub fn build_deployment(
         })
     };
 
-    let mut node_labels =
-        BTreeMap::from([(DPU_ENABLED_NODE_LABEL.to_string(), "true".to_string())]);
-    node_labels.extend(deployment_node_labels);
+    let dpu_node_selector = build_dpu_node_selector(deployment_node_labels);
 
     DPUDeployment {
         metadata: ObjectMeta {
@@ -1284,10 +1373,7 @@ pub fn build_deployment(
                     dpu_annotations: None,
                     dpu_selector: None,
                     name_suffix: "default".to_string(),
-                    dpu_node_selector: Some(DpuDeploymentDpusDpuSetsDpuNodeSelector {
-                        match_expressions: None,
-                        match_labels: Some(node_labels),
-                    }),
+                    dpu_node_selector: Some(dpu_node_selector),
                     dpu_cluster_selector: None,
                     dpu_device_selector: None,
                     node_selector: None,
@@ -1317,12 +1403,36 @@ pub fn build_deployment(
                 flavor_template: matches!(deployment_type, DpuDeploymentType::Bf4Astra)
                     .then(|| flavor_name.to_string()),
             },
-            revision_history_limit: None,
+            revision_history_limit: Some(1000),
             service_chains,
             services: services_map,
         },
         status: None,
     }
+}
+
+/// Build a selector that works with both NFD's empty-valued capability label
+/// and deployments whose DPU node label has a value. `matchLabels` requires an
+/// exact value, so `feature.node.kubernetes.io/dpu-enabled: "true"` does not
+/// match NFD's `feature.node.kubernetes.io/dpu-enabled: ""` label.
+pub(crate) fn build_dpu_node_selector(
+    mut deployment_node_labels: BTreeMap<String, String>,
+) -> DpuDeploymentDpusDpuSetsDpuNodeSelector {
+    // This key is a capability marker, not a deployment-specific selector. Keep
+    // it out of matchLabels even if an older caller still supplies it there.
+    deployment_node_labels.remove(DPU_ENABLED_NODE_LABEL);
+
+    let mut selector = json!({
+        "matchExpressions": [{
+            "key": DPU_ENABLED_NODE_LABEL,
+            "operator": "Exists",
+        }],
+    });
+    if !deployment_node_labels.is_empty() {
+        selector["matchLabels"] = json!(deployment_node_labels);
+    }
+
+    serde_json::from_value(selector).expect("static DPU node selector is valid")
 }
 
 // Pair each NIC's br-xplane patch with its Weave-managed brcx bridge patch on br-sfc.
@@ -1625,6 +1735,7 @@ pub fn build_effective_dpu_interfaces(
                 peer_bridge: interface.bridge.clone(),
                 peer_patch_name: interface.patch_port.clone(),
                 peer_external_ids: None,
+                service_mtu: None,
             }),
             pf_id: i64::from(identity.pf_id),
             vf_id: i64::from(identity.vf_id.unwrap_or_default()),
@@ -1722,6 +1833,7 @@ fn build_astra_patch_dpu_interfaces_vec() -> Vec<DpuServiceInterfaceTemplateDefi
                         peer_bridge: format!("brcx-{group_id}"),
                         peer_patch_name: String::new(),
                         peer_external_ids: None,
+                        service_mtu: None,
                     }),
                     pf_id: 0,
                     vf_id: 0,
@@ -1737,6 +1849,7 @@ fn build_astra_patch_dpu_interfaces_vec() -> Vec<DpuServiceInterfaceTemplateDefi
                             ("xplane-group-id".to_string(), group_id.to_string()),
                             ("xplane-downlink".to_string(), "patch".to_string()),
                         ])),
+                        service_mtu: None,
                     }),
                     pf_id: 0,
                     vf_id: 0,
@@ -2606,8 +2719,7 @@ async fn create_flavor_services_and_deployment<
         )
         .await?;
         for nad in &svc.service_nads {
-            DpuServiceNADRepository::apply(repo, &build_service_nad(nad, namespace, suffix))
-                .await?;
+            apply_or_validate_service_nad(repo, &build_service_nad(nad, namespace, suffix)).await?;
         }
     }
 
@@ -3333,6 +3445,35 @@ impl<R: DpuDeviceRepository, L: ResourceLabeler> DpfSdk<R, L> {
         info: DpuDeviceInfo,
         astra_provisioning_inputs: Option<(&ExpectedMachine, AstraRoutePrefixes)>,
     ) -> Result<(), DpfError> {
+        self.register_dpu_device_internal(info, astra_provisioning_inputs, None)
+            .await
+    }
+
+    /// Create a DPUDevice with its per-device credential reference already set.
+    ///
+    /// The Secret must have been created in this SDK's namespace first. Existing devices are
+    /// never switched to a different credential by registration; a mismatched reference is an error.
+    pub async fn register_dpu_device_with_credential(
+        &self,
+        info: DpuDeviceInfo,
+        astra_provisioning_inputs: Option<(&ExpectedMachine, AstraRoutePrefixes)>,
+        secret_name: &str,
+    ) -> Result<(), DpfError> {
+        bmc_credentials::validate_per_device_secret_name(secret_name)?;
+        self.register_dpu_device_internal(
+            info,
+            astra_provisioning_inputs,
+            Some(secret_name.to_string()),
+        )
+        .await
+    }
+
+    async fn register_dpu_device_internal(
+        &self,
+        info: DpuDeviceInfo,
+        astra_provisioning_inputs: Option<(&ExpectedMachine, AstraRoutePrefixes)>,
+        credential_secret_name: Option<String>,
+    ) -> Result<(), DpfError> {
         let cr_name = dpu_device_cr_name(&info.device_id);
         let expected_machine = astra_provisioning_inputs.map(|(machine, _)| machine);
         let astra_underlay_inputs = astra_provisioning_inputs.map(|(machine, prefixes)| {
@@ -3351,6 +3492,10 @@ impl<R: DpuDeviceRepository, L: ResourceLabeler> DpfSdk<R, L> {
         if let Some(existing) =
             DpuDeviceRepository::get(&*self.repo, &cr_name, &self.namespace).await?
         {
+            bmc_credentials::check_registration_credential(
+                &existing,
+                credential_secret_name.as_deref(),
+            )?;
             if existing.metadata.deletion_timestamp.is_some() {
                 return Err(DpfError::InvalidState(format!(
                     "DPUDevice {cr_name} is being deleted (has deletionTimestamp); \
@@ -3375,7 +3520,9 @@ impl<R: DpuDeviceRepository, L: ResourceLabeler> DpfSdk<R, L> {
             return Ok(());
         }
 
-        if !self.shared_bmc_password_ready.load(Ordering::Acquire) {
+        if credential_secret_name.is_none()
+            && !self.shared_bmc_password_ready.load(Ordering::Acquire)
+        {
             return Err(DpfError::BmcPasswordSourceUnavailable(
                 "cannot register a DPUDevice until the shared BMC credential has been accepted and published"
                     .to_string(),
@@ -3423,7 +3570,7 @@ impl<R: DpuDeviceRepository, L: ResourceLabeler> DpfSdk<R, L> {
                 pf0_name: None,
                 psid: None,
                 serial_number: info.serial_number,
-                bmc_credential_secret_name: None,
+                bmc_credential_secret_name: credential_secret_name.clone(),
                 cluster: None,
                 nic_device_count: None,
                 values,
@@ -3445,6 +3592,14 @@ impl<R: DpuDeviceRepository, L: ResourceLabeler> DpfSdk<R, L> {
             {
                 let existing =
                     DpuDeviceRepository::get(&*self.repo, &cr_name, &self.namespace).await?;
+                if let Some(existing) = &existing {
+                    bmc_credentials::check_registration_credential(
+                        existing,
+                        credential_secret_name.as_deref(),
+                    )?;
+                } else if credential_secret_name.is_some() {
+                    return Err(DpfError::not_found("DPUDevice", &cr_name));
+                }
                 if existing
                     .as_ref()
                     .is_some_and(|d| d.metadata.deletion_timestamp.is_some())
@@ -3638,10 +3793,13 @@ impl<R: DpuNodeRepository, L: ResourceLabeler> DpfSdk<R, L> {
         }
     }
 
-    /// Check that a DPUNode's labels contain all entries from the current
-    /// labeler's `node_labels()`. Returns `false` when the node exists but
-    /// has stale labels (e.g. from a previous label version). Returns `true`
-    /// when the node does not exist yet.
+    /// `verify_node_labels` checks the node's labels against
+    /// `node_labels_for_deployment_type` for the requested deployment.
+    ///
+    /// Returns `false` if a required label is missing or differs. Additional
+    /// labels are ignored. Returns `true` when the node does not exist;
+    /// `DPUDevice` resources are not checked. Repository and labeler errors
+    /// are returned.
     pub async fn verify_node_labels(
         &self,
         node_name: &str,
@@ -3658,13 +3816,21 @@ impl<R: DpuNodeRepository, L: ResourceLabeler> DpfSdk<R, L> {
             .node_labels_for_deployment_type(deployment_type)?;
         let node_labels = node.metadata.labels.as_ref();
 
-        Ok(required_labels.iter().all(|(key, required_value)| {
-            node_labels.is_some_and(|labels| {
-                labels
-                    .get(key)
-                    .is_some_and(|node_value| node_value == required_value)
-            })
-        }))
+        for (key, required_value) in &required_labels {
+            let actual_value = node_labels.and_then(|labels| labels.get(key));
+            if actual_value != Some(required_value) {
+                tracing::debug!(
+                    node = %node_name,
+                    ?deployment_type,
+                    label = %key,
+                    expected = %required_value,
+                    actual = ?actual_value,
+                    "DPUNode label does not match deployment selector"
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Moves one DPUNode from its source DPUDeployment selector to its target
@@ -3791,35 +3957,89 @@ impl<R: DpuNodeRepository, L: ResourceLabeler> DpfSdk<R, L> {
     }
 }
 
+impl DpuPhaseObservation {
+    fn from_dpu(dpu: DPU, cr_name: &str) -> Result<Self, DpfError> {
+        // Kubernetes keeps the CR while DPF's finalizer cleans up, so
+        // `status.phase` can still be `Ready` or `Error` after deletion starts.
+        // Report `Deleting` so callers wait for removal instead of acting on
+        // that stale status.
+        if dpu.metadata.deletion_timestamp.is_some() {
+            return Ok(Self {
+                phase: DpuPhase::Deleting,
+                failure: None,
+            });
+        }
+        let Some(status) = dpu.status else {
+            return Err(DpfError::InvalidState(format!(
+                "DPU {cr_name} has no status"
+            )));
+        };
+        let phase = status
+            .phase
+            .clone()
+            .ok_or_else(|| DpfError::InvalidState(format!("DPU {cr_name} has no status phase")))?;
+        let phase = DpuPhase::from(phase);
+        let failure = (phase == DpuPhase::Error).then(|| DpuFailureObservation {
+            name: dpu.metadata.name,
+            namespace: dpu.metadata.namespace,
+            uid: dpu.metadata.uid,
+            resource_version: dpu.metadata.resource_version,
+            generation: dpu.metadata.generation,
+            deployment: dpu
+                .metadata
+                .labels
+                .and_then(|mut labels| labels.remove(DPU_OWNED_BY_DEPLOYMENT_LABEL)),
+            dpu_node_name: dpu.spec.dpu_node_name,
+            dpu_device_name: dpu.spec.dpu_device_name,
+            dpu_flavor: dpu.spec.dpu_flavor,
+            bfb: dpu.spec.bfb,
+            blue_field_software: dpu.spec.blue_field_software,
+            status,
+        });
+        Ok(Self { phase, failure })
+    }
+}
+
 impl<R: DpuRepository, L> DpfSdk<R, L> {
-    /// Get the DPU phase for a specific DPU.
+    /// Read only the phase from [`Self::get_dpu_phase_observation`].
     pub async fn get_dpu_phase(
         &self,
         dpu_device_name: &str,
         node_name: &str,
     ) -> Result<DpuPhase, DpfError> {
+        self.get_dpu_phase_observation(dpu_device_name, node_name)
+            .await
+            .map(|observation| observation.phase)
+    }
+
+    /// `get_dpu_phase_observation` reads a DPU phase and terminal failure
+    /// details from the same CR in the SDK namespace.
+    ///
+    /// `device_id` is the device identifier without the `device-` prefix.
+    /// `node_name` accepts a node ID or DPUNode CR name; one leading `node-`
+    /// prefix is stripped before constructing the DPU CR name. For example,
+    /// `("001", "node-host-001")` reads `node-host-001-device-001`.
+    ///
+    /// A deletion timestamp returns `Deleting` without failure details, even
+    /// when status is absent or still reports `Error`. Otherwise, only `Error`
+    /// includes failure details. A missing CR returns `NotFound`, and
+    /// a CR without a deletion timestamp requires both status and its phase,
+    /// otherwise it returns `InvalidState`.
+    /// Resource read errors are propagated; deployment ownership is not checked.
+    pub async fn get_dpu_phase_observation(
+        &self,
+        device_id: &str,
+        node_name: &str,
+    ) -> Result<DpuPhaseObservation, DpfError> {
         let dpf_id = node_id_from_dpu_node_cr_name(node_name);
-        let cr_name = dpu_cr_name(dpu_device_name, dpf_id);
+        let cr_name = dpu_cr_name(device_id, dpf_id);
         let dpu = DpuRepository::get(&*self.repo, &cr_name, &self.namespace).await?;
 
         let Some(dpu) = dpu else {
             return Err(DpfError::not_found("DPU", cr_name));
         };
 
-        // A DPU being torn down (e.g. right after reprovision deleted it) still reports
-        // its old status.phase (often Ready) until the operator's finalizer runs. Treat
-        // a set deletionTimestamp as authoritative so callers never act on the stale phase.
-        if dpu.metadata.deletion_timestamp.is_some() {
-            return Ok(DpuPhase::Deleting);
-        }
-
-        let Some(status) = dpu.status else {
-            return Err(DpfError::InvalidState(format!(
-                "DPU {cr_name} has no status"
-            )));
-        };
-
-        Ok(DpuPhase::from(status.phase))
+        DpuPhaseObservation::from_dpu(dpu, &cr_name)
     }
 
     /// Reprovision a DPU by deleting the DPU CR.
@@ -3845,19 +4065,60 @@ impl<R: DpuRepository, L> DpfSdk<R, L> {
 }
 
 impl<R: DpuRepository + DpuDeploymentRepository, L: ResourceLabeler> DpfSdk<R, L> {
-    /// Read every requested DPU phase only when one deployment owns the full set.
-    ///
-    /// A DPU that is not Ready may not report its installed BFB yet, so ownership
-    /// is sufficient until that phase. A Ready DPU must also match the flavor and
-    /// provisioning source declared by the deployment. `None` means at least one
-    /// requested DPU is missing, is being deleted, belongs to another deployment,
-    /// has no status yet, or does not match the Ready configuration.
+    /// Read only the phases from
+    /// [`Self::get_dpu_phase_observations_for_deployment_type`].
     pub async fn get_dpu_phases_for_deployment_type(
         &self,
         dpu_device_names: &[String],
         node_name: &str,
         deployment_type: DpuDeploymentType,
     ) -> Result<Option<BTreeMap<String, DpuPhase>>, DpfError> {
+        let observations = self
+            .get_dpu_phase_observations_for_deployment_type(
+                dpu_device_names,
+                node_name,
+                deployment_type,
+            )
+            .await?;
+        Ok(observations.map(|observations| {
+            observations
+                .into_iter()
+                .map(|(name, observation)| (name, observation.phase))
+                .collect()
+        }))
+    }
+
+    /// `get_dpu_phase_observations_for_deployment_type` reads phases and terminal
+    /// failure details only when one deployment owns every requested DPU.
+    ///
+    /// `device_ids` contains distinct device identifiers without the `device-`
+    /// prefix. `node_name` accepts a node ID or DPUNode CR name; one leading
+    /// `node-` prefix is stripped before constructing DPU CR names. Returned
+    /// map keys are the input device IDs, ordered lexicographically.
+    ///
+    /// Each DPU is read by name in the SDK namespace. Its phase and diagnostics
+    /// come from that same read.
+    /// A DPU that is not `Ready` may not report its installed BFB yet, so
+    /// ownership is sufficient until that phase. A `Ready` DPU must also match
+    /// the flavor and provisioning source declared by the deployment.
+    ///
+    /// `None` means the deployment has not reported `DPUSetsReconciled=True`
+    /// for its current generation, or a requested DPU is missing, is being
+    /// deleted, belongs to another deployment, or has no status or phase. Duplicate
+    /// device IDs also return `None`. No partial map is returned, including
+    /// when an observed DPU reports `Error`. Empty input returns an empty map
+    /// after deployment checks, without reading any DPUs.
+    ///
+    /// Returns `DpfError::InvalidState` if the deployment uses a
+    /// `DPUFlavorTemplate` or a `Ready` DPU's configuration differs or cannot
+    /// be compared. Errors from deployment lookup and resource reads are
+    /// propagated.
+    pub async fn get_dpu_phase_observations_for_deployment_type(
+        &self,
+        device_ids: &[String],
+        node_name: &str,
+        deployment_type: DpuDeploymentType,
+    ) -> Result<Option<BTreeMap<String, DpuPhaseObservation>>, DpfError> {
         let (deployment_name, deployment) = self.deployment_for_type(deployment_type).await?;
         if !dpu_deployment_is_ready(&deployment) {
             return Ok(None);
@@ -3870,19 +4131,16 @@ impl<R: DpuRepository + DpuDeploymentRepository, L: ResourceLabeler> DpfSdk<R, L
         }
 
         let expected_owner = dpu_deployment_owner_label_value(&self.namespace, &deployment_name);
-        let owner_selector = format!("{DPU_OWNED_BY_DEPLOYMENT_LABEL}={expected_owner}");
         let dpf_id = node_id_from_dpu_node_cr_name(node_name);
-        let mut dpus_by_name =
-            DpuRepository::list(&*self.repo, &self.namespace, Some(&owner_selector))
-                .await?
-                .into_iter()
-                .filter_map(|dpu| Some((dpu.metadata.name.clone()?, dpu)))
-                .collect::<HashMap<_, _>>();
-        let mut phases = BTreeMap::new();
+        let mut observations = BTreeMap::new();
 
-        for dpu_device_name in dpu_device_names {
-            let cr_name = dpu_cr_name(dpu_device_name, dpf_id);
-            let Some(dpu) = dpus_by_name.remove(&cr_name) else {
+        for device_id in device_ids {
+            if observations.contains_key(device_id) {
+                return Ok(None);
+            }
+            let cr_name = dpu_cr_name(device_id, dpf_id);
+            let Some(dpu) = DpuRepository::get(&*self.repo, &cr_name, &self.namespace).await?
+            else {
                 return Ok(None);
             };
             let has_expected_owner = dpu
@@ -3898,7 +4156,10 @@ impl<R: DpuRepository + DpuDeploymentRepository, L: ResourceLabeler> DpfSdk<R, L
             let Some(status) = dpu.status.as_ref() else {
                 return Ok(None);
             };
-            let phase = DpuPhase::from(status.phase.clone());
+            let Some(phase) = status.phase.clone() else {
+                return Ok(None);
+            };
+            let phase = DpuPhase::from(phase);
             if phase == DpuPhase::Ready {
                 match dpu_comparison(&self.namespace, &dpu, &deployment) {
                     DpuComparison::Match => {}
@@ -3915,10 +4176,13 @@ impl<R: DpuRepository + DpuDeploymentRepository, L: ResourceLabeler> DpfSdk<R, L
                     }
                 }
             }
-            phases.insert(dpu_device_name.clone(), phase);
+            observations.insert(
+                device_id.clone(),
+                DpuPhaseObservation::from_dpu(dpu, &cr_name)?,
+            );
         }
 
-        Ok(Some(phases))
+        Ok(Some(observations))
     }
 
     /// Delete source deployment DPU CRs without deleting target replacements.
@@ -3941,15 +4205,11 @@ impl<R: DpuRepository + DpuDeploymentRepository, L: ResourceLabeler> DpfSdk<R, L
         let target_owner =
             dpu_deployment_owner_label_value(&self.namespace, &target_deployment_name);
         let dpf_id = node_id_from_dpu_node_cr_name(node_name);
-        let mut dpus_by_name = DpuRepository::list(&*self.repo, &self.namespace, None)
-            .await?
-            .into_iter()
-            .filter_map(|dpu| Some((dpu.metadata.name.clone()?, dpu)))
-            .collect::<HashMap<_, _>>();
 
         for dpu_device_name in dpu_device_names {
             let cr_name = dpu_cr_name(dpu_device_name, dpf_id);
-            let Some(dpu) = dpus_by_name.remove(&cr_name) else {
+            let Some(dpu) = DpuRepository::get(&*self.repo, &cr_name, &self.namespace).await?
+            else {
                 continue;
             };
             let owner = dpu
@@ -4286,8 +4546,9 @@ fn dpu_deployment_is_ready(d: &DPUDeployment) -> bool {
     cond.status == "True" && cond.observed_generation == Some(generation)
 }
 
-/// Returns true when one DPUSet in a deployment contains every required
-/// DPUNode selector label.
+/// Returns true when one DPUSet selects every required DPUNode label. The
+/// capability marker may be selected by presence because NFD gives it an empty
+/// value on OpenShift.
 fn dpu_deployment_selects_labels(
     deployment: &DPUDeployment,
     required_labels: &BTreeMap<String, String>,
@@ -4299,15 +4560,24 @@ fn dpu_deployment_selects_labels(
         .as_ref()
         .is_some_and(|dpu_sets| {
             dpu_sets.iter().any(|dpu_set| {
-                dpu_set
-                    .dpu_node_selector
-                    .as_ref()
-                    .and_then(|selector| selector.match_labels.as_ref())
-                    .is_some_and(|labels| {
-                        required_labels
-                            .iter()
-                            .all(|(key, value)| labels.get(key) == Some(value))
+                dpu_set.dpu_node_selector.as_ref().is_some_and(|selector| {
+                    required_labels.iter().all(|(key, value)| {
+                        selector
+                            .match_labels
+                            .as_ref()
+                            .is_some_and(|labels| labels.get(key) == Some(value))
+                            || (key == DPU_ENABLED_NODE_LABEL
+                                && selector
+                                    .match_expressions
+                                    .as_ref()
+                                    .is_some_and(|expressions| {
+                                        expressions.iter().any(|expression| {
+                                            expression.key == *key
+                                                && expression.operator == "Exists"
+                                        })
+                                    }))
                     })
+                })
             })
         })
 }
@@ -4538,7 +4808,11 @@ impl<R: DpuNodeRepository + DpuDeviceRepository + DpuRepository, L> DpfSdk<R, L>
                     spec_dpu_flavor: Some(d.spec.dpu_flavor.clone()),
                     spec_dpu_device_name: d.spec.dpu_device_name.clone(),
                     spec_dpu_node_name: d.spec.dpu_node_name.clone(),
-                    status_phase: d.status.as_ref().map(|s| format!("{:?}", s.phase)),
+                    status_phase: d
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.phase.as_ref())
+                        .map(|phase| format!("{phase:?}")),
                     status_bfb_file: d.status.as_ref().and_then(|s| s.bfb_file.clone()),
                     status_conditions: d.status.as_ref().and_then(|s| s.conditions.clone()),
                     status_operational_conditions: d
@@ -6315,7 +6589,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_disables_secure_boot() {
+    fn deployment_defaults() {
         let deployment = build_deployment(
             &[],
             "deployment",
@@ -6327,6 +6601,7 @@ mod tests {
             DpuDeploymentType::Bf3,
         );
 
+        assert_eq!(deployment.spec.revision_history_limit, Some(1000));
         assert_eq!(deployment.spec.dpus.secure_boot, Some(false));
         assert_eq!(
             serde_json::to_value(deployment).unwrap()["spec"]["dpus"]["secureBoot"],
@@ -6914,6 +7189,10 @@ mod tests {
 
     #[async_trait]
     impl crate::repository::DpfOperatorConfigRepository for SdkMock {
+        async fn get_version(&self, _: &str, _: &str) -> Result<String, DpfError> {
+            Ok("26.8.0".to_string())
+        }
+
         async fn get(
             &self,
             _name: &str,
@@ -8099,7 +8378,9 @@ mod tests {
                 astra_enabled: None,
             },
             status: Some(DpuStatus {
-                phase: DpuStatusPhase::Ready,
+                phase: Some(DpuStatusPhase::Ready),
+                dpu_reconfig: None,
+                post_provisioning_dpu_config: None,
                 addresses: None,
                 bf_cfg_file: None,
                 bfb_file: None,
@@ -8197,6 +8478,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_dpu_phase_reports_deleting_when_terminating() {
+        use carbide_test_support::Outcome::Yields;
+        use carbide_test_support::{Case, check_cases_async};
         use kube::core::ObjectMeta;
 
         use crate::crds::dpus_generated::{DpuSpec, DpuStatus, DpuStatusPhase};
@@ -8207,8 +8490,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A DPU that has been deleted (reprovision) but whose finalizer has not yet
-        // run: it carries a deletionTimestamp while its status.phase is still Ready.
+        // Reprovisioning sets `deletionTimestamp` while the finalizer is still
+        // cleaning up. The old phase must not make this CR actionable again.
         let dpu_name = "node-dpu-001-device-dpu-001";
         let dpu = DPU {
             metadata: ObjectMeta {
@@ -8242,7 +8525,9 @@ mod tests {
                 astra_enabled: None,
             },
             status: Some(DpuStatus {
-                phase: DpuStatusPhase::Ready,
+                phase: Some(DpuStatusPhase::Error),
+                dpu_reconfig: None,
+                post_provisioning_dpu_config: None,
                 addresses: None,
                 bf_cfg_file: None,
                 bfb_file: None,
@@ -8270,17 +8555,43 @@ mod tests {
                 reboot_status: None,
             }),
         };
-        mock.dpus
-            .write()
-            .unwrap()
-            .insert(format!("{}/{}", TEST_NAMESPACE, dpu_name), dpu);
+        check_cases_async(
+            [
+                Case {
+                    scenario: "deletion overrides stale Ready status",
+                    input: DpuStatusPhase::Ready,
+                    expect: Yields((DpuPhase::Deleting, true, DpuPhase::Deleting)),
+                },
+                Case {
+                    scenario: "deletion overrides stale Error status",
+                    input: DpuStatusPhase::Error,
+                    expect: Yields((DpuPhase::Deleting, true, DpuPhase::Deleting)),
+                },
+            ],
+            |stale_phase| {
+                let mut dpu = dpu.clone();
+                let mock = &mock;
+                let sdk = &sdk;
+                async move {
+                    dpu.status.as_mut().expect("DPU status").phase = Some(stale_phase);
+                    mock.dpus
+                        .write()
+                        .unwrap()
+                        .insert(format!("{}/{}", TEST_NAMESPACE, dpu_name), dpu);
 
-        let phase = sdk.get_dpu_phase("dpu-001", "node-dpu-001").await.unwrap();
-        assert_eq!(
-            phase,
-            DpuPhase::Deleting,
-            "a DPU with a deletionTimestamp must report Deleting even though its stale status.phase is Ready"
-        );
+                    let observation = sdk
+                        .get_dpu_phase_observation("dpu-001", "node-dpu-001")
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let phase = sdk
+                        .get_dpu_phase("dpu-001", "node-dpu-001")
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((observation.phase, observation.failure.is_none(), phase))
+                }
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -8520,6 +8831,10 @@ mod tests {
 
     #[async_trait]
     impl crate::repository::DpfOperatorConfigRepository for SecretTrackingMock {
+        async fn get_version(&self, _: &str, _: &str) -> Result<String, DpfError> {
+            Ok("26.8.0".to_string())
+        }
+
         async fn get(
             &self,
             _name: &str,
@@ -8910,6 +9225,62 @@ mod tests {
         let observed = dpu_service_from_resource(dpu_service_to_resource(&service)).unwrap();
         assert_eq!(observed.service_id, service.service_id);
         assert_eq!(observed.interfaces, service.interfaces);
+    }
+
+    /// Verifies privileged opt-in survives while disabled SPIFFE and omitted DPF DaemonSet settings
+    /// stay absent because the platform chart owns its privileged CNI daemon manifest.
+    #[tokio::test]
+    async fn dpu_service_absent_spiffe_and_daemon_set_round_trip_through_repository() {
+        // Disable the two optional fields on a complete service; the helper supplies valid
+        // metadata and Helm settings needed to exercise repository creation.
+        let mut desired_service = test_dpu_service("detached-service");
+        desired_service.security.privileged = true;
+        desired_service.security.spiffe = false;
+        desired_service.service_daemon_set = None;
+        let mock = SdkMock::new();
+        let sdk = DpfSdkBuilder::new(mock.clone(), TEST_NAMESPACE, String::new())
+            .build_without_resources()
+            .await
+            .unwrap();
+
+        // Create through DpfSdk and verify the repository response preserves both omissions.
+        let created_service = sdk.create_dpu_service(&desired_service).await.unwrap();
+        let created_security = created_service
+            .security
+            .as_ref()
+            .expect("created service must retain its security object");
+        assert_eq!(created_security.privileged, Some(true));
+        assert!(!created_security.spiffe);
+        assert!(created_service.service_daemon_set.is_none());
+
+        // Inspect the stored checked CR because both fields must be absent from Kubernetes JSON.
+        let stored_service = mock
+            .services
+            .read()
+            .unwrap()
+            .get(&SdkMock::ns_key(TEST_NAMESPACE, "detached-service"))
+            .cloned()
+            .expect("created service must be stored");
+        let stored_document = serde_json::to_value(stored_service).unwrap();
+        assert_eq!(
+            stored_document["spec"]["security"],
+            json!({"privileged": true})
+        );
+        assert!(stored_document["spec"].get("serviceDaemonSet").is_none());
+
+        // Reread through the public SDK operation to prove persistence preserves both omissions.
+        let persisted_service = sdk
+            .get_dpu_service("detached-service")
+            .await
+            .unwrap()
+            .expect("created service must be observable");
+        let persisted_security = persisted_service
+            .security
+            .as_ref()
+            .expect("persisted service must retain its security object");
+        assert_eq!(persisted_security.privileged, Some(true));
+        assert!(!persisted_security.spiffe);
+        assert!(persisted_service.service_daemon_set.is_none());
     }
 
     /// Verifies the serialized DPUService omits nodeSelector when no selector is

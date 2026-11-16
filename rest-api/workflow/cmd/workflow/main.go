@@ -94,7 +94,9 @@ import (
 	skuActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/sku"
 	skuWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/sku"
 
+	sitePrefixActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/siteprefix"
 	vpcPrefixActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/vpcprefix"
+	sitePrefixWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/siteprefix"
 	vpcPrefixWorkflow "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/workflow/vpcprefix"
 
 	vpcPeeringActivity "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/vpcpeering"
@@ -312,6 +314,7 @@ func run(ctx context.Context) error {
 
 		// VPC Prefix workflow
 		w.RegisterWorkflow(vpcPrefixWorkflow.UpdateVpcPrefixInventory)
+		w.RegisterWorkflow(sitePrefixWorkflow.UpdateSitePrefixInventory)
 
 		// VPC Peering workflow
 		w.RegisterWorkflow(vpcPeeringWorkflow.UpdateVpcPeeringInventory)
@@ -353,12 +356,14 @@ func run(ctx context.Context) error {
 		reg.MustRegister(collectors.NewGoCollector())
 
 		// Register core metrics
-		cm := cwm.NewCoreMetrics(reg, mconfig.Namespace)
-		// TODO: Set version here when available
-		cm.Info.With(prometheus.Labels{"version": "unknown", "namespace": tcfg.Namespace}).Set(1)
+		cwm.NewCoreMetrics(reg, mconfig.Namespace, tcfg.Namespace)
 
 		// Published by the Site health monitor cron, which runs on the Cloud queue.
 		siteHealthMetrics = cwm.NewSiteHealthMetrics(reg, mconfig.Namespace)
+
+		if tcfg.Namespace == cwfn.CloudNamespace {
+			cwm.NewPendingExpectedMachineBatchMetrics(reg, dbSession, mconfig.Namespace)
+		}
 
 		if tcfg.Namespace == cwfn.SiteNamespace {
 			// The inventory workflows that report these metrics only run here.
@@ -422,6 +427,8 @@ func run(ctx context.Context) error {
 
 	vpcPrefixManager := vpcPrefixActivity.NewManageVpcPrefix(dbSession, siteClientPool)
 	w.RegisterActivity(&vpcPrefixManager)
+	sitePrefixManager := sitePrefixActivity.NewManageSitePrefix(dbSession)
+	w.RegisterActivity(&sitePrefixManager)
 
 	vpcPeeringManager := vpcPeeringActivity.NewManageVpcPeering(dbSession, siteClientPool)
 	w.RegisterActivity(&vpcPeeringManager)

@@ -11,6 +11,22 @@ podAnnotations: {}
 image:
   name: nico-rest-site-manager
 
+## Pod-level security context. 1000 is the `nvs` user the image declares; the
+## image names it rather than giving a UID, which the kubelet cannot verify, so
+## runAsNonRoot needs the number spelled out here. Override for OpenShift, where
+## the restricted SCC assigns UIDs from the namespace range and rejects fixed
+## numeric UIDs.
+## Keep runAsNonRoot: true and null only the fixed UID/GID so the SCC assigns
+## them from the range while the non-root assertion is preserved:
+##   podSecurityContext:
+##     runAsNonRoot: true
+##     runAsUser: null
+##     fsGroup: null
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
 service:
   type: ClusterIP
   port: 8100
@@ -80,3 +96,14 @@ rbac:
 # the binary exports traces when OTEL_EXPORTER_OTLP_ENDPOINT (or the traces
 # specific endpoint) is set and otherwise only forwards trace context.
 extraEnv: {}
+
+# A separate, client-only identity; the serving certificate is not used for admission.
+clientCertificate:
+  # -- Override only the client issuer; empty uses global.certificate.issuerRef.
+  issuerRef: {}
+  enabled: true
+  secretName: site-manager-client-tls
+  duration: 2160h
+  renewBefore: 360h
+  # -- Empty derives spiffe://<global.spiffe.trustDomain>/<namespace>/sa/<service-account>.
+  spiffeID: ""

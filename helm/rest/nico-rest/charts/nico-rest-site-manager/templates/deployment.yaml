@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- if hasKey .Values.extraEnv "CREDS_MANAGER_CLIENT_CERT_PATH" }}
+{{- fail "configure CREDS_MANAGER_CLIENT_CERT_PATH through chart values, not extraEnv" }}
+{{- end }}
+{{- if hasKey .Values.extraEnv "CREDS_MANAGER_CLIENT_KEY_PATH" }}
+{{- fail "configure CREDS_MANAGER_CLIENT_KEY_PATH through chart values, not extraEnv" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,13 +33,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "nico-rest-site-manager.name" . }}
-      # 1000 is the `nvs` user the image declares. The image names it rather
-      # than giving a UID, which the kubelet cannot verify, so runAsNonRoot
-      # needs the number spelled out here.
+      {{- with .Values.podSecurityContext }}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        fsGroup: 1000
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: site-manager
           image: "{{ include "nico-rest-site-manager.image" . }}"
@@ -57,14 +60,21 @@ spec:
           ports:
             - containerPort: {{ .Values.service.port }}
               name: https
-          {{- with .Values.extraEnv }}
           env:
+            - name: CREDS_MANAGER_CLIENT_CERT_PATH
+              value: /etc/credsmgr-client/tls.crt
+            - name: CREDS_MANAGER_CLIENT_KEY_PATH
+              value: /etc/credsmgr-client/tls.key
+          {{- with .Values.extraEnv }}
             {{- range $k, $v := . }}
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
           {{- end }}
           volumeMounts:
+            - name: credsmgr-client
+              mountPath: /etc/credsmgr-client
+              readOnly: true
             - name: tls-certs
               mountPath: /etc/tls
               readOnly: true
@@ -90,6 +100,9 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 15
       volumes:
+        - name: credsmgr-client
+          secret:
+            secretName: {{ .Values.clientCertificate.secretName }}
         - name: tls-certs
           secret:
             secretName: {{ .Values.certificate.secretName }}
@@ -101,7 +114,7 @@ spec:
             items:
               - key: {{ .Values.credsManagerCa.key }}
                 path: ca.crt
-        # sitemgr skips its own cert issuance while `args.tlsCertPath` and
+        # Site Manager skips its own cert issuance while `args.tlsCertPath` and
         # `args.tlsKeyPath` are set. Clearing either one sends it back to
         # writing /tmp/mgr.cert, so keep this writable alongside the read-only
         # root filesystem.

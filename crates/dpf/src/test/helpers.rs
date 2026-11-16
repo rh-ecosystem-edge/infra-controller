@@ -34,6 +34,8 @@ use crate::crds::dpus_generated::*;
 use crate::error::DpfError;
 use crate::repository::{DpfOperatorConfigRepository, DpuRepository, K8sConfigRepository};
 
+pub(super) const DPF_VERSION: &str = "26.8.0";
+
 pub(super) struct Collector<T> {
     pub(super) items: Mutex<Vec<T>>,
     notify: Notify,
@@ -207,7 +209,9 @@ pub(super) fn make_status(phase: DpuStatusPhase) -> DpuStatus {
         firmware: None,
         observed_generation: None,
         pci_device: None,
-        phase,
+        phase: Some(phase),
+        dpu_reconfig: None,
+        post_provisioning_dpu_config: None,
         post_provisioning_node_effect: None,
         required_reset: None,
         agent_last_startup_time: None,
@@ -267,7 +271,12 @@ pub(super) fn make_dpu(
 }
 
 pub(super) fn make_dpu_reboot(ns: &str, name: &str, device: &str, node: &str) -> DPU {
-    make_dpu(ns, name, device, node, DpuStatusPhase::Rebooting)
+    let mut dpu = make_dpu(ns, name, device, node, DpuStatusPhase::Rebooting);
+    dpu.metadata.labels = Some(BTreeMap::from([(
+        "carbide.nvidia.com/host-bmc-ip".into(),
+        "10.0.0.42".into(),
+    )]));
+    dpu
 }
 
 #[allow(dead_code)]
@@ -333,6 +342,10 @@ impl K8sConfigRepository for ConfigMock {
 
 #[async_trait]
 impl DpfOperatorConfigRepository for ConfigMock {
+    async fn get_version(&self, _: &str, _: &str) -> Result<String, DpfError> {
+        Ok(DPF_VERSION.to_string())
+    }
+
     async fn get(
         &self,
         _name: &str,

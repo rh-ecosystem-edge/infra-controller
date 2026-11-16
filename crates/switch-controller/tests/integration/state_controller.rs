@@ -345,6 +345,7 @@ pub(super) async fn build_test_component_manager(
         None,
         Some(env.pool.clone()),
         None,
+        None,
     )
     .await
     .expect("test component manager should build");
@@ -454,6 +455,7 @@ async fn test_configure_certificate_start_skips_without_component_manager(
                 std::time::Duration::from_secs(60),
             ),
             redfish_client_pool: env.redfish_sim.clone(),
+            bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
             bmc_credential_ops: env.redfish_sim.clone(),
             bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                 db::credential_rotation::CredentialRotationType::Bmc,
@@ -528,6 +530,7 @@ async fn test_configure_certificate_start_transitions_to_wait_for_complete_with_
                 std::time::Duration::from_secs(60),
             ),
             redfish_client_pool: env.redfish_sim.clone(),
+            bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
             bmc_credential_ops: env.redfish_sim.clone(),
             bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                 db::credential_rotation::CredentialRotationType::Bmc,
@@ -604,6 +607,7 @@ async fn test_non_primary_with_only_cluster_services_skips_certificate_job(
             Duration::from_secs(60),
         ),
         redfish_client_pool: env.redfish_sim.clone(),
+        bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
         bmc_credential_ops: env.redfish_sim.clone(),
         bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
             db::credential_rotation::CredentialRotationType::Bmc,
@@ -716,6 +720,7 @@ async fn test_configure_certificate_start_seeds_expected_switch_credentials(
                 std::time::Duration::from_secs(60),
             ),
             redfish_client_pool: env.redfish_sim.clone(),
+            bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
             bmc_credential_ops: env.redfish_sim.clone(),
             bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                 db::credential_rotation::CredentialRotationType::Bmc,
@@ -793,6 +798,7 @@ async fn test_configure_certificate_start_retries_after_credential_import(
             std::time::Duration::from_secs(60),
         ),
         redfish_client_pool: env.redfish_sim.clone(),
+        bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
         bmc_credential_ops: env.redfish_sim.clone(),
         bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
             db::credential_rotation::CredentialRotationType::Bmc,
@@ -893,6 +899,7 @@ async fn test_configure_certificate_wait_for_complete_transitions_to_rotate_os_p
                 std::time::Duration::from_secs(60),
             ),
             redfish_client_pool: env.redfish_sim.clone(),
+            bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
             bmc_credential_ops: env.redfish_sim.clone(),
             bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                 db::credential_rotation::CredentialRotationType::Bmc,
@@ -934,6 +941,7 @@ async fn test_configure_certificate_wait_for_complete_transitions_to_error_on_fa
 
     let failing_mock = MockNvSwitchManager::default().with_certificate_job_status(
         ConfigureSwitchCertificateJobStatus {
+            failure: None,
             state: ConfigureSwitchCertificateState::Failed,
             error: Some("cert install failed".to_string()),
         },
@@ -951,6 +959,7 @@ async fn test_configure_certificate_wait_for_complete_transitions_to_error_on_fa
                 std::time::Duration::from_secs(60),
             ),
             redfish_client_pool: env.redfish_sim.clone(),
+            bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
             bmc_credential_ops: env.redfish_sim.clone(),
             bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                 db::credential_rotation::CredentialRotationType::Bmc,
@@ -1034,6 +1043,7 @@ async fn test_switch_deletion_with_state_controller(
             std::time::Duration::from_secs(60),
         ),
         redfish_client_pool: env.redfish_sim.clone(),
+        bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
         bmc_credential_ops: env.redfish_sim.clone(),
         bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
             db::credential_rotation::CredentialRotationType::Bmc,
@@ -1147,6 +1157,7 @@ async fn test_switch_entire_state_transition_flow(
                 switch_mtls_services: default_switch_mtls_services(),
                 per_object_metrics_registry: env.per_object_metrics_registry.clone(),
                 redfish_client_pool: env.redfish_sim.clone(),
+                bmc_connector: bmc_backend::BmcConnector::Libredfish(env.redfish_sim.clone()),
                 bmc_credential_ops: env.redfish_sim.clone(),
                 bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
                     db::credential_rotation::CredentialRotationType::Bmc,
@@ -1328,6 +1339,7 @@ async fn test_rack_error_unwinds_switch_waiting_for_nvos(
             rack.controller_state.version,
             rack.controller_state.version.increment(),
             &RackState::Error {
+                certificate_failure: None,
                 cause: "profile SOT unavailable".to_string(),
                 recovery_policy: RackErrorRecoveryPolicy::MaintenanceRequestRequired,
             },

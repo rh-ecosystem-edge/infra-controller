@@ -31,6 +31,8 @@ default = []
 test-support = ["dep:mockall"]
 
 [dependencies]
+bmc-backend = { path = "../bmc-backend" }
+bmc-runtime = { path = "../bmc-runtime" }
 bmc-vendor = { path = "../bmc-vendor" }
 carbide-api-db = { path = "../api-db", default-features = false }
 carbide-api-model = { path = "../api-model", default-features = false }
@@ -87,6 +89,9 @@ carbide-redfish = { path = "../redfish", features = ["test-support"] }
 carbide-secrets = { path = "../secrets", features = ["test-support"] }
 carbide-test-harness = { path = "../test-harness" }
 carbide-test-support = { path = "../test-support" }
+carbide-utils = { path = "../utils", default-features = false, features = [
+  "test-support",
+] }
 
 figment = { workspace = true, features = ["env", "test", "toml"] }
 regex = { workspace = true }

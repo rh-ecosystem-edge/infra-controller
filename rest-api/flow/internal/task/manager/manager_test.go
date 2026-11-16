@@ -1567,6 +1567,10 @@ func (s *managerTaskStore) ListPowerTasksForRack(_ context.Context, _ uuid.UUID)
 	panic("managerTaskStore.ListPowerTasksForRack: not implemented")
 }
 
+func (s *managerTaskStore) ListFirmwareTasksForRack(_ context.Context, _ uuid.UUID) ([]taskdef.FirmwareTaskDetails, error) {
+	panic("managerTaskStore.ListFirmwareTasksForRack: not implemented")
+}
+
 func (s *managerTaskStore) LatestLeakageShutdownTaskStatuses(
 	_ context.Context,
 	_ []uuid.UUID,
@@ -1803,4 +1807,9 @@ func (e *managerExecutor) TerminateTask(
 		e.terminationObservedTransaction = e.transactionActive()
 	}
 	return e.terminateErr
+}
+
+// ListTaskContextForRack fails unexpected context reads in task-manager tests.
+func (s *managerTaskStore) ListTaskContextForRack(_ context.Context, _ uuid.UUID) ([]taskdef.TaskContextMetadata, error) {
+	panic("unexpected task context read")
 }

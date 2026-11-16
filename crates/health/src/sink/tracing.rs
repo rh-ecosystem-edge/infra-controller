@@ -130,6 +130,21 @@ impl DataSink for TracingSink {
                     "Firmware info event"
                 );
             }
+            CollectorEvent::ResourceStatusObservation(_) => {}
+            CollectorEvent::ResourceStatus(info) => {
+                tracing::info!(
+                    endpoint = %context.endpoint_key(),
+                    collector = %context.collector_type,
+                    rack_id = context.rack_id().map(tracing::field::display),
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
+                    resource_type = info.resource_type.as_str(),
+                    resource_id = %info.id,
+                    resource_name = %info.name,
+                    status = ?info.status,
+                    "Redfish resource status event"
+                );
+            }
             CollectorEvent::HealthReport(report) => {
                 tracing::info!(
                     endpoint = %context.endpoint_key(),
@@ -232,6 +247,7 @@ mod tests {
 
         let metric = CollectorEvent::Metric(
             crate::sink::MetricSample {
+                semantics: crate::sink::MetricSemantics::Gauge,
                 key: "redfish@127.0.0.1:443".to_string(),
                 name: "tcp_port".to_string(),
                 metric_type: "reachable".to_string(),

@@ -10,7 +10,7 @@ metadata:
 spec:
   replicas: {{ .Values.replicas }}
   strategy:
-    type: RollingUpdate
+    {{- toYaml .Values.strategy | nindent 4 }}
   selector:
     matchLabels:
       {{- include "nico-api.selectorLabels" . | nindent 6 }}
@@ -106,9 +106,13 @@ spec:
           image: "{{ include "nico-api.image" . }}"
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           securityContext:
-            capabilities:
-              add:
-                - SYS_PTRACE
+            allowPrivilegeEscalation: false
+            {{- with .Values.containerSecurityContext }}
+            {{- $ctxOverrides := omit . "allowPrivilegeEscalation" }}
+            {{- with $ctxOverrides }}
+            {{- toYaml $ctxOverrides | nindent 12 }}
+            {{- end }}
+            {{- end }}
           command:
             - /bin/sh
             - -c
@@ -140,6 +144,8 @@ spec:
               fi
               {{ .Values.command | nindent 14 }}
           env:
+            {{- /* Vault settings; a site installed without Vault sets vault.enabled=false. */}}
+            {{- if .Values.vault.enabled }}
             - name: VAULT_ROLE_ID
               valueFrom:
                 secretKeyRef:
@@ -180,10 +186,11 @@ spec:
                   key: NICO_VAULT_PKI_MOUNT
             - name: VAULT_PKI_ROLE_NAME
               value: {{ .Values.env.VAULT_PKI_ROLE_NAME | quote }}
+            {{- end }}
             - name: DATASTORE_USER
               valueFrom:
                 secretKeyRef:
-                  key: username
+                  key: {{ .Values.envFrom.databaseCredentials.usernameKey | default "username" | quote }}
                   name: {{ .Values.envFrom.databaseCredentials.secretName }}
             - name: DATASTORE_PASSWORD
               valueFrom:
@@ -272,10 +279,12 @@ spec:
               mountPath: /etc/forge/carbide-api
             - name: {{ include "nico-api.name" . }}-config-files
               mountPath: /etc/nico/nico-api
+            {{- if .Values.siteConfig.enabled }}
             - name: {{ include "nico-api.name" . }}-site-config-files
               mountPath: /etc/forge/carbide-api/site
             - name: {{ include "nico-api.name" . }}-site-config-files
               mountPath: /etc/nico/nico-api/site
+            {{- end }}
             {{- if .Values.credentials.file.existingSecret.name }}
             - name: credentials-file
               mountPath: {{ required "nico-api.credentials.file.mountPath is required when credentials.file.existingSecret.name is set" .Values.credentials.file.mountPath | quote }}
@@ -316,9 +325,11 @@ spec:
         - name: {{ include "nico-api.name" . }}-config-files
           configMap:
             name: {{ include "nico-api.name" . }}-config-files
+        {{- if .Values.siteConfig.enabled }}
         - name: {{ include "nico-api.name" . }}-site-config-files
           configMap:
             name: {{ include "nico-api.name" . }}-site-config-files
+        {{- end }}
         {{- if .Values.credentials.file.existingSecret.name }}
         - name: credentials-file
           secret:

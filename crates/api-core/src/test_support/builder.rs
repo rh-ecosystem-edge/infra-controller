@@ -28,7 +28,6 @@ use carbide_resource_pool::ResourcePoolRegistry;
 use carbide_secrets::credentials::CredentialManager;
 use carbide_secrets::test_support::certificates::TestCertificateProvider;
 use carbide_secrets::test_support::credentials::TestCredentialManager;
-use carbide_site_explorer::config::SiteExplorerExploreMode;
 use carbide_site_explorer::test_support::MockEndpointExplorer;
 use carbide_site_explorer::{
     AuthenticatedBmc, AuthenticatedBmcClient, EndpointExplorationService, EndpointExplorer,
@@ -51,6 +50,7 @@ use crate::dynamic_settings::DynamicSettings;
 use crate::ethernet_virtualization::{EthVirtData, SiteFabricPrefixList};
 use crate::logging::level_filter::ActiveLevel;
 use crate::logging::log_limiter::LogLimiter;
+use crate::resource_pool::ResourcePoolMonitor;
 use crate::scout_stream::ConnectionRegistry;
 use crate::test_support::default_config;
 use crate::test_support::ib_fabric::ib_fabric_test_manager;
@@ -227,8 +227,8 @@ impl TestApiBuilder {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_firmware_object_fetcher(
+    /// Sets the firmware-object fetcher shared with controller test fixtures.
+    pub fn with_firmware_object_fetcher(
         self,
         firmware_object_fetcher: Arc<dyn FirmwareObjectFetcher>,
     ) -> Self {
@@ -242,6 +242,10 @@ impl TestApiBuilder {
         let runtime_config = self
             .runtime_config
             .unwrap_or_else(|| Arc::new(default_config::get()));
+        let mut resource_pool_monitor =
+            ResourcePoolMonitor::new(self.db_pool.clone(), &runtime_config.resource_pool_backends)
+                .expect("valid resource pool backend configuration");
+        resource_pool_monitor.use_registry_clients(&self.resource_pool_registry);
 
         let scout_stream_registry = ConnectionRegistry::new();
         let credential_manager = self
@@ -290,7 +294,7 @@ impl TestApiBuilder {
         let real_endpoint_explorer = carbide_site_explorer::new_bmc_explorer(
             real_bmc_client.clone(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            SiteExplorerExploreMode::NvRedfish,
+            false,
             self.db_pool.clone(),
         );
         // A mock supplies both narrow interfaces so tests asserting on BMC calls
@@ -343,10 +347,12 @@ impl TestApiBuilder {
             // dyn upcast: the ops handle is also the general pool in tests.
             redfish_pool: redfish_pool.clone(),
             bmc_credential_ops: redfish_pool,
+            driver_connector: None,
             bmc_proxy_passthrough: None,
             eth_data,
             common_pools: self.common_pools,
             resource_pool_registry: self.resource_pool_registry,
+            resource_pool_monitor,
             ib_fabric_manager,
             dynamic_settings,
             endpoint_explorer,

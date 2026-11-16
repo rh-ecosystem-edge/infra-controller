@@ -195,6 +195,10 @@ func (m *mockTaskStore) ListPowerTasksForRack(_ context.Context, _ uuid.UUID) ([
 	panic("mockTaskStore.ListPowerTasksForRack: not implemented")
 }
 
+func (m *mockTaskStore) ListFirmwareTasksForRack(_ context.Context, _ uuid.UUID) ([]taskdef.FirmwareTaskDetails, error) {
+	panic("mockTaskStore.ListFirmwareTasksForRack: not implemented")
+}
+
 func (m *mockTaskStore) LatestLeakageShutdownTaskStatuses(
 	_ context.Context,
 	_ []uuid.UUID,
@@ -1330,4 +1334,9 @@ func TestFireNow(t *testing.T) {
 		_, err := d.FireNow(context.Background(), schedID)
 		require.ErrorContains(t, err, "db error")
 	})
+}
+
+// ListTaskContextForRack fails unexpected context reads in scheduling tests.
+func (m *mockTaskStore) ListTaskContextForRack(_ context.Context, _ uuid.UUID) ([]taskdef.TaskContextMetadata, error) {
+	panic("unexpected task context read")
 }

@@ -16,15 +16,15 @@
  */
 
 //! Packet-level counters for the Kea hook, plus the metrics endpoint, health
-//! plumbing, and the certificate-expiry gauge.
+//! plumbing, and the certificate-expiry gauge and its `_seconds` alias.
 //!
 //! The counters are `carbide-instrument` events declared with `log = off`:
 //! the Kea process installs no tracing subscriber, so the C++ `LOG_ERROR`
 //! lines in `callouts.cc` remain the log side and the events move only the
 //! metric. The DHCPv4 counters retain their existing exposed Prometheus names
 //! and `reason` label values, while DHCPv6 traffic uses explicit v6 metric
-//! names. The certificate-expiry gauge is point-in-time state, not an
-//! occurrence, and stays on the observable-gauge pattern. `metrics_server`
+//! names. The certificate-expiry gauge and its alias are point-in-time state,
+//! not occurrences, and stay on the observable-gauge pattern. `metrics_server`
 //! installs the metrics endpoint's Prometheus-only meter provider, so there is
 //! no separate OTLP instrument-name contract for these counters.
 
@@ -38,7 +38,7 @@ use metrics_endpoint::{
     HealthController, MetricsEndpointConfig, MetricsSetup, new_metrics_setup, run_metrics_endpoint,
 };
 use opentelemetry::StringValue;
-use rpc::forge_tls_client::{self, ApiConfig, ForgeClientConfig};
+use rpc::carbide_tls_client::{self, ApiConfig, CarbideClientConfig};
 use tokio::runtime::Runtime;
 use tokio::time::{interval, timeout};
 
@@ -424,7 +424,7 @@ async fn certificate_loop() {
             .metrics
             .clone();
         if let Some(metrics) = metrics
-            && let Some(client_expiry) = metrics.forge_client_config.client_cert_expiry()
+            && let Some(client_expiry) = metrics.carbide_client_config.client_cert_expiry()
         {
             metrics
                 .certificate_expiration_value
@@ -436,24 +436,44 @@ async fn certificate_loop() {
 fn initialize_metrics(mconf: &MetricsSetup) -> CarbideDhcpMetrics {
     let certificate_expiration_value = Arc::new(AtomicI64::new(0));
     let metrics = CarbideDhcpMetrics {
-        forge_client_config: tls::build_forge_client_config(),
+        carbide_client_config: tls::build_carbide_client_config(),
         certificate_expiration_value: certificate_expiration_value.clone(),
     };
 
     // Observable gauges don't need to be stored anywhere, they're
     // stored internally within the meter and the callback is run when metrics are
     // collected.
-    mconf
-        .meter
-        .i64_observable_gauge("carbide-dhcp.certificate_expiration_time")
-        .with_description("The certificate expiration time (epoch seconds)")
-        .with_callback(move |observer| {
-            let measurement = certificate_expiration_value.deref().load(Ordering::SeqCst);
-            observer.observe(measurement, &[]);
-        })
-        .build();
+    // The _seconds alias states the unit; retain the original name for compatible queries.
+    for name in [
+        "carbide-dhcp.certificate_expiration_time",
+        "carbide_dhcp_certificate_expiration_time_seconds",
+    ] {
+        let certificate_expiration_value = certificate_expiration_value.clone();
+        mconf
+            .meter
+            .i64_observable_gauge(name)
+            .with_description("The certificate expiration time (epoch seconds)")
+            .with_callback(move |observer| {
+                let measurement = certificate_expiration_value.deref().load(Ordering::SeqCst);
+                observer.observe(measurement, &[]);
+            })
+            .build();
+    }
 
     metrics
+}
+
+/// Registers the DHCP certificate-expiry gauge and its alias with a fixed Unix
+/// timestamp in seconds.
+/// Keep the returned setup alive while collecting metrics so its provider retains the callbacks.
+#[cfg(any(test, feature = "test-support"))]
+pub fn metrics_setup_with_certificate_expiry(expiry: i64) -> eyre::Result<MetricsSetup> {
+    let setup = new_metrics_setup("carbide-dhcp", "forge-system", false)?;
+    let metrics = initialize_metrics(&setup);
+    metrics
+        .certificate_expiration_value
+        .store(expiry, Ordering::SeqCst);
+    Ok(setup)
 }
 
 pub(super) fn metrics_server() {
@@ -509,9 +529,12 @@ pub(super) fn metrics_server() {
     }
 }
 
-async fn check_api_connectivity(carbide_api_url: &str, client_config: &ForgeClientConfig) -> bool {
+async fn check_api_connectivity(
+    carbide_api_url: &str,
+    client_config: &CarbideClientConfig,
+) -> bool {
     let api_config: ApiConfig<'_> = ApiConfig::new(carbide_api_url, client_config);
-    match forge_tls_client::ForgeTlsClient::retry_build(&api_config).await {
+    match carbide_tls_client::CarbideTlsClient::retry_build(&api_config).await {
         Ok(mut client) => {
             let request = tonic::Request::new(rpc::forge::EchoRequest {
                 message: "dhcp_echo".into(),
@@ -534,7 +557,7 @@ async fn check_api_connectivity(carbide_api_url: &str, client_config: &ForgeClie
 
 async fn start_readiness_monitoring() {
     let mut readiness_interval = interval(READINESS_CHECK_FREQUENCY);
-    let forge_client_config = tls::build_forge_client_config();
+    let carbide_client_config = tls::build_carbide_client_config();
 
     let url = &CONFIG.read().expect("config poisoned").api_endpoint.clone();
 
@@ -542,7 +565,7 @@ async fn start_readiness_monitoring() {
         readiness_interval.tick().await;
         match timeout(
             Duration::from_secs(10),
-            check_api_connectivity(url, &forge_client_config),
+            check_api_connectivity(url, &carbide_client_config),
         )
         .await
         {
@@ -642,8 +665,8 @@ mod tests {
     use super::*;
     use crate::discovery::{DiscoveryBuilderResult, discovery_builder_result_as_str};
 
-    /// The certificate-expiry gauge stays on the per-process meter; its
-    /// exposition is pinned verbatim.
+    /// The certificate-expiry gauge and its alias keep their exposition and observe
+    /// updated values on the fixture's meter.
     #[test]
     fn certificate_gauge_exposition_is_stable() {
         let mconf = new_metrics_setup("carbide-dhcp", "forge-system", false).unwrap();
@@ -659,6 +682,22 @@ mod tests {
 
         let prom_metrics = String::from_utf8(buffer).unwrap();
         assert_eq!(prom_metrics, include_str!("../tests/fixtures/metrics.txt"));
+
+        metrics
+            .certificate_expiration_value
+            .store(1750000000, Ordering::SeqCst);
+        let families = mconf.registry.gather();
+        for name in [
+            "carbide_dhcp_certificate_expiration_time",
+            "carbide_dhcp_certificate_expiration_time_seconds",
+        ] {
+            let family = families
+                .iter()
+                .find(|family| family.name() == name)
+                .expect("certificate expiry gauge is exported");
+            assert_eq!(family.get_metric().len(), 1);
+            assert_eq!(family.get_metric()[0].get_gauge().value(), 1750000000.0);
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ The chart is designed for production environments where NICo manages the full li
 
 | #  | Subchart | Description |
 |----|----------|-------------|
-| 1  | **nico-api** | Core API server (gRPC + REST). Manages machines, provisioning, networking, and firmware. Requires PostgreSQL and Vault. |
+| 1  | **nico-api** | Core API server (gRPC + REST). Manages machines, provisioning, networking, and firmware. Requires PostgreSQL and, unless `nico-api.vault.enabled` is `false`, Vault. |
 | 2  | **nico-bmc-proxy** | Authenticating proxy for connecting to BMCs over HTTPS (Redfish). Required for DPS-based power provisioning. |
 | 3  | **nico-dhcp** | Kea DHCP server for bare-metal PXE boot and IP assignment. |
 | 4  | **nico-dns** | Authoritative DNS server (StatefulSet) for managed machines and VPCs. |
@@ -29,11 +29,11 @@ The chart is designed for production environments where NICo manages the full li
 
 - **Kubernetes** 1.27+
 - **Helm** 3.12+
-- **cert-manager** with a `ClusterIssuer` configured (default issuer name: `vault-nico-issuer`)
-- **HashiCorp Vault** for PKI certificate issuance and, by default, secret storage. NICo can keep its managed credentials in Postgres instead; see [Secrets Storage](../docs/configuration/secrets-storage.md).
+- **cert-manager** with a `ClusterIssuer` configured (default issuer name: `vault-nico-issuer`; a site without Vault uses a CA issuer such as the reference installation's `site-issuer`)
+- **HashiCorp Vault**, by default, for PKI certificate issuance and secret storage. NICo can keep its managed credentials in Postgres instead (refer to [Secrets Storage](../docs/configuration/secrets-storage.md)), and a site that also issues certificates through a cert-manager CA issuer can run without Vault; refer to [Running without Vault](#running-without-vault).
 - **PostgreSQL** (SSL-enabled) for the `nico-api` database backend
 - **Prometheus Operator CRDs** if you enable `ServiceMonitor` resources
-- **Required Kubernetes Secrets and ConfigMaps** (Vault tokens, database credentials, SSO secrets, etc.)
+- **Required Kubernetes Secrets and ConfigMaps** (Vault tokens when Vault is used, database credentials, SSO secrets, etc.)
 
 For the full list of required secrets, ConfigMaps, and infrastructure setup steps, see [PREREQUISITES.md](./PREREQUISITES.md).
 
@@ -69,20 +69,50 @@ Top-level `global:` values are automatically passed to all subcharts.
 | `global.certificate.renewBefore` | Renew certificates before expiry | `360h0m0s` |
 | `global.certificate.privateKey.algorithm` | Certificate private key algorithm | `ECDSA` |
 | `global.certificate.privateKey.size` | Certificate private key size | `384` |
-| `global.certificate.issuerRef.name` | cert-manager ClusterIssuer name | `vault-nico-issuer` |
+| `global.certificate.issuerRef.name` | cert-manager ClusterIssuer name (`site-issuer` on a site without Vault) | `vault-nico-issuer` |
 | `global.certificate.issuerRef.kind` | cert-manager issuer kind | `ClusterIssuer` |
 | `global.certificate.issuerRef.group` | cert-manager issuer API group | `cert-manager.io` |
 | `global.spiffe.trustDomain` | SPIFFE trust domain for mTLS | `nico.local` |
 | `global.labels` | Common labels applied to all resources | See `values.yaml` |
 
+### Running without Vault
+
+The `nico-api.vault.enabled` value (default `true`) controls whether the
+`nico-api` Deployment takes its Vault connection from the cluster. With `false`, the chart
+renders none of the `VAULT_*` environment variables (the AppRole, token, and
+`vault-cluster-info` references under `nico-api.envFrom`) and rejects a
+non-empty `nico-api.vaultClusterInfo` at render time with
+`nico-api.vaultClusterInfo is set but nico-api.vault.enabled is false: remove vaultClusterInfo or set vault.enabled=true`.
+Set it to `false` only when `nico-api` needs no Vault:
+
+- The `[secrets]` section in the site configuration keeps credentials in
+  Postgres, with no `vault` backend, writer, or `import_from`, and no `transit`
+  KEK provider.
+- Both `global.certificate.useCertManager` and `global.certificate.useCertManagerUfm`
+  are `true`, so machine and UFM certificates come from cert-manager
+  `CertificateRequest` resources against `nico-api.machineCertificates.issuerRef`
+  (default `site-issuer`) instead of Vault PKI.
+- The `global.certificate.issuerRef.name` value, and every `issuerRef` that
+  overrides it, names a cert-manager issuer that does not sign through Vault,
+  such as the reference installation's `site-issuer` CA issuer.
+
+If the site configuration still needs Vault, `nico-api` fails at startup and
+names the setting; refer to
+[How It Works](../docs/configuration/secrets-storage.md#how-it-works). A
+`Certificate` that still references an absent `vault-nico-issuer` is never
+issued, so its pod does not start. The reference installer sets all of this
+with `setup.sh --skip-vault`; refer to
+[Installing without Vault](../helm-prereqs/README.md#installing-without-vault).
+
 ### NVSwitch mTLS Certificates
 
 `nico-api.nvSwitchTls` can ask cert-manager to issue NICo's dedicated NMX-C
 client identity and, optionally, the NVSwitch server identity. Both leaves
-use the existing `nvSwitchTls.issuerRef`, which defaults to
-`vault-nico-issuer`. NMX-C/NVUE must trust the CA behind that issuer when NICo
-connects, and NICo must use an independently managed CA bundle that validates
-the server certificate presented by the switch.
+use `nvSwitchTls.issuerRef`, or `global.certificate.issuerRef` when it is
+empty, which defaults to `vault-nico-issuer`. NMX-C/NVUE must trust the CA
+behind that issuer when NICo connects, and NICo must use an independently
+managed CA bundle that validates the server certificate presented by the
+switch.
 
 The profiles are deliberately fixed to the capabilities each peer needs:
 
@@ -95,10 +125,33 @@ The profiles are deliberately fixed to the capabilities each peer needs:
   nico-api. A switch installer or operator must copy the certificate, private
   key, and CA to NMX-C/NVUE and bind them there.
 
-Both profiles are off by default. Enable `switchServer` only when this Helm
-release should own the server artifact. Configure `dnsNames` or `ipAddresses`,
-as appropriate, with a SAN that exactly matches `nmx_c_tls_authority` in the
-NICo site configuration.
+`nicoClient` is on by default. When `nicoClient.uris` is empty, its URI SAN is
+`spiffe://<global.spiffe.trustDomain>/<release namespace>/sa/nico-nmxc`, for
+example `spiffe://nico.local/nico-system/sa/nico-nmxc`.
+
+NVLink partitioning is off by default. Set `nico-api.nvlink.enabled` to render
+`nvlink_config.enabled` into the base configuration; a value in the site
+configuration takes precedence. On a rack with running instances, enabling it
+removes the NMX-C default partition on the first monitor pass.
+
+When `nvlink_config.enabled` or
+`nvlink_config.nmx_c_certificate_rotation.enabled` is `true`, nico-api fills
+in unset NMX-C TLS settings at startup:
+
+- If the site configuration sets none of the four `nvlink_config.nmx_c_tls_*`
+  keys and `mountPath` keeps its default, nico-api uses this certificate for
+  NMX-C mTLS, with `initial_domain_name` as the TLS authority.
+- If `nvlink_config.nmx_c_tls_ca_cert_path` is unset and NMX-C is reached over
+  HTTPS, nico-api uses `ca.crt` from the client Secret, or else
+  `/var/run/secrets/nico-roots/ca.crt`, as the CA bundle. NMX-C is reached
+  over plain HTTP, with no CA, when `allow_insecure = true` and no client
+  certificate and key are set.
+
+`switchServer` is off by default. Enable it only when this Helm release should
+own the server artifact. Configure `dnsNames` or `ipAddresses`, as
+appropriate, with a SAN that exactly matches `nmx_c_tls_authority`. When the
+site configuration sets none of the `nmx_c_tls_*` keys, that authority is
+`initial_domain_name`.
 
 ```yaml
 nico-api:
@@ -138,6 +191,10 @@ deployment mechanism.
 The configured issuer and any cert-manager approver policy must allow both
 requested URI/DNS identities, durations, key profile, and usages. Creating the
 Kubernetes Secret does not install or bind the server identity on a switch.
+
+`nico-bmc-proxy.switchTls` issues the proxy its own client certificate the same
+way, for switches whose NVUE REST API requires one, and points the proxy at it.
+See the [nico-bmc-proxy chart README](charts/nico-bmc-proxy/README.md#switch-client-tls).
 
 ### Grafana Dashboards
 
@@ -448,7 +505,7 @@ set `alternatePort: 0` to work around it.
 
 ```text
                          +-----------------+
-                         |    nico-api     |  <-- PostgreSQL, Vault
+                         |    nico-api     |  <-- PostgreSQL, Vault (optional)
                          +--------+--------+
                                   |
           +-----------+-----------+-----------+-----------+
@@ -460,7 +517,7 @@ set `alternatePort: 0` to work around it.
      (PXE boot)            (OS install)
 ```
 
-All services that communicate with `nico-api` use mTLS via SPIFFE-based certificates issued by cert-manager and backed by Vault PKI.
+All services that communicate with `nico-api` use mTLS via SPIFFE-based certificates issued by cert-manager through the configured ClusterIssuer: Vault PKI (`vault-nico-issuer`) by default, or a CA issuer such as `site-issuer` on a site without Vault.
 
 ## Examples
 
@@ -546,6 +603,7 @@ nico-api:
 
 nico-bmc-proxy:
   nameOverride: carbide-bmc-proxy
+  apiServiceName: carbide-api
   certificate:
     identityNamespace: forge-system
   auth:
@@ -603,8 +661,9 @@ This is also available as a ready-to-use overlay at
   `spiffe://forge.local/forge-system/sa/carbide-api`).
 - `auth.namespace: forge-system` — tells `nico-api` to accept SPIFFE IDs whose path contains
   `/forge-system/`, which is what pre-2.0.0 client certificates present.
-- `apiServiceName: carbide-api` — tells `nico-pxe`, `nico-dhcp`, `nico-dns`, and
-  `nico-ssh-console-rs` to dial `carbide-api` (the name the Service has after `nameOverride`),
+- `apiServiceName: carbide-api` — tells `nico-pxe`, `nico-dhcp`, `nico-dns`,
+  `nico-ssh-console-rs`, and `nico-bmc-proxy` to dial `carbide-api` (the name the Service has
+  after `nameOverride`),
   rather than the new default `nico-api`. Without this, those services build a URL pointing at
   a Service that does not exist.
 

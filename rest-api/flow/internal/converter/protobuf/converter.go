@@ -902,13 +902,14 @@ func RackTo(r *rack.Rack) *pb.Rack {
 	}
 
 	result := &pb.Rack{
-		Info:            DeviceInfoTo(&r.Info),
-		ExternalId:      r.ExternalID,
-		RackProfileId:   r.RackProfileID,
-		Location:        LocationTo(&r.Loc),
-		Components:      components,
-		OperationStatus: PhaseTo(r.OperationStatus),
-		Health:          HealthReportTo(r.Health),
+		Info:                   DeviceInfoTo(&r.Info),
+		ExternalId:             r.ExternalID,
+		RackProfileId:          r.RackProfileID,
+		Location:               LocationTo(&r.Loc),
+		Components:             components,
+		OperationStatus:        PhaseTo(r.OperationStatus),
+		OperationStatusDetails: r.OperationStatusDetails.ToProto(),
+		Health:                 HealthReportTo(r.Health),
 	}
 	if r.NVLDomainID != uuid.Nil {
 		result.NvlDomainIds = UUIDsTo([]uuid.UUID{r.NVLDomainID})
@@ -1714,5 +1715,24 @@ func QueueOptionsFrom(
 		return operation.ConflictStrategyQueue, timeout
 	default:
 		return operation.ConflictStrategyReject, timeout
+	}
+}
+
+// TaskKindTo describes a task without its operation payload. Stored task types
+// without a known API kind map to Unspecified.
+func TaskKindTo(kind taskcommon.TaskType) pb.TaskKind {
+	switch kind {
+	case taskcommon.TaskTypePowerControl:
+		return pb.TaskKind_TASK_KIND_POWER_CONTROL
+	case taskcommon.TaskTypeFirmwareControl:
+		return pb.TaskKind_TASK_KIND_FIRMWARE_CONTROL
+	case taskcommon.TaskTypeBringUp:
+		return pb.TaskKind_TASK_KIND_BRING_UP
+	case taskcommon.TaskTypeDecommission:
+		return pb.TaskKind_TASK_KIND_DECOMMISSION
+	case taskcommon.TaskTypeInjectExpectation:
+		return pb.TaskKind_TASK_KIND_INJECT_EXPECTATION
+	default:
+		return pb.TaskKind_TASK_KIND_UNSPECIFIED
 	}
 }

@@ -1,3 +1,4 @@
+{{- include "nico-hardware-health.validateTerminationGracePeriod" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,6 +19,7 @@ spec:
         {{- include "nico-hardware-health.labels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "nico-hardware-health.name" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -27,9 +29,13 @@ spec:
           image: "{{ include "nico-hardware-health.image" . }}"
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           securityContext:
-            capabilities:
-              add:
-                - SYS_PTRACE
+            allowPrivilegeEscalation: false
+            {{- with .Values.containerSecurityContext }}
+            {{- $ctxOverrides := omit . "allowPrivilegeEscalation" }}
+            {{- with $ctxOverrides }}
+            {{- toYaml $ctxOverrides | nindent 12 }}
+            {{- end }}
+            {{- end }}
           command:
             - /bin/sh
             - -c

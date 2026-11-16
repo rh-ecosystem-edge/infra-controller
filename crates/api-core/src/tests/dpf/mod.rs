@@ -20,9 +20,10 @@ mod dpu_service_sync_release;
 mod happy_path;
 mod reprovisioning;
 mod stale_labels;
+mod update_preflight;
 mod waiting_for_ready;
 
-use carbide_dpf::DpuServiceVersion;
+use carbide_dpf::{DpuPhase, DpuPhaseObservation, DpuServiceVersion};
 use carbide_machine_controller::dpf::MockDpfOperations;
 use model::machine::ManagedHostState;
 
@@ -41,6 +42,26 @@ fn dpf_config() -> crate::cfg::file::DpfConfig {
             },
             ..Default::default()
         },
+        ..Default::default()
+    }
+}
+
+/// Builds BF4 test configuration with BlueFieldSoftware so mocked ingestion satisfies the production provisioning-source contract.
+///
+/// Callers must use distinct names for deployments in the same configuration.
+pub(super) fn bf4_deployment_config(name: &str) -> crate::cfg::file::DpfDeploymentConfig {
+    crate::cfg::file::DpfDeploymentConfig {
+        bfb_url: None, // BF4 provisioning requires the BlueFieldSoftware source below.
+        bluefield_software: Some(crate::cfg::file::DpfBlueFieldSoftwareConfig {
+            os_iso: format!("http://example.com/{name}.iso"),
+            pldm_fw_bundle: std::collections::BTreeMap::from([(
+                "test-psid".to_string(),
+                format!("http://example.com/{name}.pldm"),
+            )]),
+        }),
+        flavor_name: format!("test-{name}-flavor"),
+        deployment_name: format!("test-{name}"),
+        node_label_key: format!("test.nvidia.com/{name}"),
         ..Default::default()
     }
 }
@@ -86,5 +107,13 @@ async fn assert_provisioning_suppressed(env: &TestEnv, mh: &TestManagedHost, exp
             expected,
             "provisioning suppression for {mac}"
         );
+    }
+}
+
+/// Builds an operator observation for fixtures that do not report a failure.
+pub(super) fn phase_observation(phase: DpuPhase) -> DpuPhaseObservation {
+    DpuPhaseObservation {
+        phase,
+        failure: None,
     }
 }

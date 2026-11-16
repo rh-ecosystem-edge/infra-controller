@@ -199,11 +199,11 @@ The `sku show` command can be used to list all SKUs, or show the details of a si
 nico-admin-cli sku show [<sku id>]
 
 > nico-admin-cli sku show
-+----------------------------------------------------------------+---------------------------------------------------------+------------------------------+-----------------------------+
-| ID                                                             | Description                                             | Model                        | Created                     |
-+================================================================+=========================================================+==============================+=============================+
-| PowerEdge R750 1xGPU 1xIB                                      | PowerEdge R750; 2xCPU; 1xGPU; 128 GiB                   | PowerEdge R750               | 2025-02-27T13:57:19.435162Z |
-+----------------------------------------------------------------+---------------------------------------------------------+------------------------------+-----------------------------+
++----------------------------------------------------------------+---------------------------------------------------------+------------------------------+-----------------------------+-----------------------------+
+| ID                                                             | Description                                             | Model                        | Created                     | Updated                     |
++================================================================+=========================================================+==============================+=============================+=============================+
+| PowerEdge R750 1xGPU 1xIB                                      | PowerEdge R750; 2xCPU; 1xGPU; 128 GiB                   | PowerEdge R750               | 2025-02-27T13:57:19.435162Z | 2025-02-27T13:57:19.435162Z |
++----------------------------------------------------------------+---------------------------------------------------------+------------------------------+-----------------------------+-----------------------------+
 
 > nico-admin-cli sku show 'PowerEdge R750 1xGPU 1xIB'
 ID                  : PowerEdge R750 1xGPU 1xIB
@@ -213,6 +213,7 @@ Device Type         :
 Model               : PowerEdge R750
 Architecture        : x86_64
 Created At          : 2025-02-27T13:57:19.435162Z
+Updated At          : 2025-02-27T13:57:19.435162Z
 TPM Version         : 2.0
 
 CPUs:
@@ -256,6 +257,7 @@ Device Type         :
 Model               : PowerEdge R750
 Architecture        : x86_64
 Created At          : 2025-02-27T13:57:19.435162Z
+Updated At          :
 TPM Version         : 2.0
 
 CPUs:
@@ -350,7 +352,9 @@ that already exists; use `sku assign` and `sku unassign` for that.
 The two paths differ in when the SKU has to exist. REST requires a supplied `skuId` to identify an existing SKU
 at the Expected Machine's Site. For single POST and PATCH requests, REST checks your Site access before looking
 up the SKU. It rejects missing SKUs and SKUs from another Site with HTTP 422 and "SKU ID specified in request
-does not exist". Batch create and update requests return HTTP 400 with a per-item `skuID` error prefixed by
+does not exist". If the SKU lookup fails because of a database error, these single requests return HTTP 500
+with "Failed to validate SKU ID in request data due to DB error" and `data: null`.
+Batch create and update requests return HTTP 400 with a per-item `skuID` error prefixed by
 "the SkuID specified for Expected Machine does not exist in DB:" followed by the supplied ID. Replace-all
 returns HTTP 400 and "SkuID specified for an Expected Machine does not exist on the Site". The admin CLI saves
 the entry without checking, so a host whose entry names a SKU that does not exist yet enters `SkuMissing` as
@@ -544,11 +548,11 @@ Then replace the old SKU
 
 ```sh
 nico-admin-cli sku replace /tmp/xe9680.json
-+--------+---------------------------------------+------------------+-----------------------------+
-| ID     | Description                           | Model            | Created                     |
-+========+=======================================+==================+=============================+
-| XE9680 | PowerEdge XE9680; 2xCPU; 8xGPU; 2 TiB | PowerEdge XE9680 | 2025-04-18T16:30:58.748991Z |
-+--------+---------------------------------------+------------------+-----------------------------+
++--------+---------------------------------------+------------------+-----------------------------+-----------------------------+
+| ID     | Description                           | Model            | Created                     | Updated                     |
++========+=======================================+==================+=============================+=============================+
+| XE9680 | PowerEdge XE9680; 2xCPU; 8xGPU; 2 TiB | PowerEdge XE9680 | 2025-04-18T16:30:58.748991Z | 2025-04-18T16:31:30.102938Z |
++--------+---------------------------------------+------------------+-----------------------------+-----------------------------+
 
 ```
 
@@ -563,6 +567,7 @@ Device Type         :
 Model               : PowerEdge XE9680
 Architecture        : x86_64
 Created At          : 2025-04-18T16:30:58.748991Z
+Updated At          : 2025-04-18T16:31:30.102938Z
 TPM Version         : 2.0
 
 CPUs:

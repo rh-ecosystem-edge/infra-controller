@@ -228,10 +228,17 @@ pub mod agent_local {
     include!(concat!(env!("OUT_DIR"), "/agent_local.rs"));
 }
 
+/// Private Unix-socket protocol used by firmware clients and the per-slot supervisor.
+#[allow(non_snake_case, unknown_lints, clippy::all)]
+#[rustfmt::skip]
+pub mod firmware_supervisor {
+    include!(concat!(env!("OUT_DIR"), "/firmware_supervisor.rs"));
+}
+
 #[allow(clippy::all, deprecated)]
 #[rustfmt::skip]
-pub mod forge_api_client {
-    include!(concat!(env!("OUT_DIR"), "/forge_api_client.rs"));
+pub mod carbide_api_client {
+    include!(concat!(env!("OUT_DIR"), "/carbide_api_client.rs"));
 }
 
 #[allow(clippy::all)]

@@ -22,6 +22,7 @@ use serde::{Serialize, Serializer};
 pub mod arch;
 pub mod cmd;
 pub mod config;
+pub mod duration;
 mod host_port_pair;
 mod listen_addr;
 pub mod managed_loop;
@@ -30,6 +31,7 @@ pub mod metrics;
 pub mod none_if_empty;
 pub mod periodic_timer;
 pub mod redfish;
+pub mod reloading;
 #[cfg(feature = "shutdown-handler")]
 pub mod shutdown_handler;
 pub mod sku;

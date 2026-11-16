@@ -70,6 +70,15 @@ nico-api:
       tag: "latest"
       command: ["sh", "-c", "cp -r /machine-validation /forge-boot-artifacts/blobs/internal"]
 
+  ## Vault runtime configuration. Keep the default (enabled) on a Vault site. A
+  ## site installed with `setup.sh --skip-vault` sets it false, sets both
+  ## global.certificate.useCertManager and global.certificate.useCertManagerUfm
+  ## to true, issues its certificates from the site-issuer ClusterIssuer
+  ## (global.certificate.issuerRef.name: site-issuer), and leaves
+  ## vaultClusterInfo below empty. Refer to helm/charts/nico-api/values.yaml.
+  # vault:
+  #   enabled: false
+
   env:
     VAULT_PKI_ROLE_NAME: "nico-cluster"
     RUST_BACKTRACE: "full"
@@ -148,7 +157,8 @@ nico-api:
       dhcp_servers=["nico-dhcp.nico-system.svc.cluster.local:67"]
       route_servers=[]
 
-  ## Create Vault and DB ConfigMaps from values (alternative to external ConfigMaps)
+  ## Create Vault and DB ConfigMaps from values (alternative to external ConfigMaps).
+  ## vaultClusterInfo is rejected (the render fails) while vault.enabled is false.
   vaultClusterInfo:
     VAULT_SERVICE: "https://vault.example.com"
     # Optional. Used for Vault Enterprise/HCP Vault Dedicated; not a Kubernetes namespace.
@@ -372,6 +382,12 @@ nico-bmc-proxy:
       identity_keyfile_path = "/var/run/secrets/spiffe.io/tls.key"
       root_cafile_path = "/var/run/secrets/spiffe.io/ca.crt"
       admin_root_cafile_path = "/etc/nico/nico-bmc-proxy/site/admin_root_cert_pem"
+
+      [carbide_api]
+      api_url = "https://nico-api.nico-system.svc.cluster.local:1079"
+      root_ca = "/var/run/secrets/spiffe.io/ca.crt"
+      client_cert = "/var/run/secrets/spiffe.io/tls.crt"
+      client_key = "/var/run/secrets/spiffe.io/tls.key"
 
       [auth.trust]
       spiffe_trust_domain = "nico.local"

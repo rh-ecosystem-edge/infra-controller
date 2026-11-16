@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use ::rpc::forge as rpc;
 use carbide_resource_pool::{PoolDefinitionSource, ResourcePoolRegistry};
+use futures::StreamExt;
 use model::resource_pool::binding::{
     INTEGRATED_AUTHORITY_ID, ResourcePoolBackendKind, ResourcePoolSelection,
 };
@@ -87,7 +88,15 @@ pub(crate) async fn grow(
                     &api.common_pools,
                 )
                 .await
-                .map_err(CarbideError::from)?;
+                .map_err(|source| {
+                    if source.is_lock_not_available() {
+                        CarbideError::Ipv6LoopbackBackfillContended {
+                            source: Box::new(source),
+                        }
+                    } else {
+                        source.into()
+                    }
+                })?;
             }
             Ok(Response::new(rpc::GrowResourcePoolResponse {}))
         }
@@ -112,6 +121,20 @@ pub(crate) async fn list(
 
     let mut txn = api.txn_begin().await?;
 
+    // This response cannot represent unknown counts. Reject the whole listing
+    // when a remote binding exists instead of reporting a misleading zero.
+    if db::resource_pool::binding::all(txn.as_pgconn())
+        .await
+        .map_err(CarbideError::from)?
+        .iter()
+        .any(|binding| binding.backend_kind == ResourcePoolBackendKind::Grpc)
+    {
+        return Err(CarbideError::FailedPrecondition(
+            "remote resource pools require AdminInspectResourcePools".to_owned(),
+        )
+        .into());
+    }
+
     let snapshot = db::resource_pool::all(&mut txn)
         .await
         .map_err(CarbideError::from)?;
@@ -121,4 +144,22 @@ pub(crate) async fn list(
     Ok(Response::new(rpc::ResourcePools {
         pools: snapshot.into_iter().map(|s| s.into()).collect(),
     }))
+}
+
+/// `inspect` reads current backend statistics through the shared monitor,
+/// sorted by pool name for a stable admin listing. Unlike metrics, the listing
+/// omits local pools that have neither inventory nor a saved binding.
+pub(crate) async fn inspect(
+    api: &Api,
+    request: Request<rpc::InspectResourcePoolsRequest>,
+) -> Result<Response<rpc::InspectResourcePoolsResponse>, Status> {
+    crate::api::log_request_data(&request);
+    let mut pools: Vec<_> = api
+        .resource_pool_monitor
+        .observe(&[])
+        .await?
+        .collect()
+        .await;
+    pools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(Response::new(rpc::InspectResourcePoolsResponse { pools }))
 }

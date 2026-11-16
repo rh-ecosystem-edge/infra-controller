@@ -36,7 +36,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/extra/bundebug"
+	tclient "go.temporal.io/sdk/client"
 	tmocks "go.temporal.io/sdk/mocks"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -69,6 +71,8 @@ func testExpectedMachineInitDB(t *testing.T) *cdb.Session {
 	err = dbSession.DB.ResetModel(ctx, (*cdbm.TenantSite)(nil))
 	assert.Nil(t, err)
 	err = dbSession.DB.ResetModel(ctx, (*cdbm.SKU)(nil))
+	assert.Nil(t, err)
+	err = dbSession.DB.ResetModel(ctx, (*cdbm.PendingExpectedMachine)(nil))
 	assert.Nil(t, err)
 	err = dbSession.DB.ResetModel(ctx, (*cdbm.InstanceType)(nil))
 	assert.Nil(t, err)
@@ -128,10 +132,49 @@ func testExpectedMachineSetupTestData(t *testing.T, dbSession *cdb.Session, org 
 	return ip, site
 }
 
+// Bun hooks cannot return errors, so fail the SKU attachment lookup with a
+// canceled child of the query context.
+type testExpectedMachineSKULookupFailureHook struct {
+	armed   bool
+	fired   bool
+	selects int
+}
+
+func (h *testExpectedMachineSKULookupFailureHook) BeforeQuery(ctx context.Context, event *bun.QueryEvent) context.Context {
+	if !strings.HasPrefix(event.Query, "SELECT ") || !strings.Contains(event.Query, `FROM "sku"`) {
+		return ctx
+	}
+	h.selects++
+	if !h.armed || !strings.Contains(event.Query, "FOR KEY SHARE") {
+		return ctx
+	}
+	h.armed = false
+	h.fired = true
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	return canceled
+}
+
+func (h *testExpectedMachineSKULookupFailureHook) AfterQuery(context.Context, *bun.QueryEvent) {}
+
 func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
-	t.Run("complete mutation conflict", func(t *testing.T) {
-		testExpectedMachineMutationRejectsCompleteMutationLock(t, "single create")
-	})
+	t.Run("pending batch identity conflict", func(t *testing.T) { testExpectedMachinePendingOverlap(t, "single create") })
+	scenarios := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{name: "complete mutation conflict", run: func(t *testing.T) {
+			testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "single create"})
+		}},
+		{name: "SKU recreated on another Site before attachment", run: func(t *testing.T) {
+			testExpectedMachineRejectsRecreatedSKU(t, "single create")
+		}},
+		{name: "BMC credentials forwarded to workflow", run: testCreateExpectedMachineBmcCredentialsForwardedToWorkflow},
+		{name: "DPF setting forwarded to workflow", run: testCreateExpectedMachineDpfEnabledForwardedToWorkflow},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, scenario.run)
+	}
 
 	// Setup
 	e := echo.New()
@@ -175,7 +218,7 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 		Name:                     "other-managed-site",
 		Org:                      org,
 		InfrastructureProviderID: infraProv.ID,
-		Status:                   cdbm.SiteStatusRegistered,
+		Status:                   cdbm.SiteStatusPending,
 	}
 	_, err = dbSession.DB.NewInsert().Model(otherSite).Exec(ctx)
 	require.NoError(t, err)
@@ -207,6 +250,8 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 	scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 	handler := NewCreateExpectedMachineHandler(dbSession, scp, cfg)
+	skuLookupFailure := &testExpectedMachineSKULookupFailureHook{}
+	dbSession.DB.AddQueryHook(skuLookupFailure)
 
 	// Helper function to create mock user
 	createMockUser := func(org string) *cdbm.User {
@@ -233,6 +278,7 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 		expectedStatus   int
 		expectedErrorMsg *string
 		rejectsMutation  bool
+		failSKULookup    bool
 	}{
 		{
 			name: "successful creation",
@@ -364,6 +410,23 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 			expectedStatus: http.StatusForbidden,
 		},
 		{
+			name: "SKU lookup failure returns 500 without mutation or dispatch",
+			requestBody: model.APIExpectedMachineCreateRequest{
+				SiteID:              site.ID.String(),
+				BmcMacAddress:       "00:11:22:33:44:A4",
+				ChassisSerialNumber: "SKU-LOOKUP-FAILURE",
+				SkuID:               cutil.GetPtr("test-sku-uuid-2"),
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus:  http.StatusInternalServerError,
+			rejectsMutation: true,
+			failSKULookup:   true,
+		},
+		{
 			name: "foreign Site SKU returns 422",
 			requestBody: model.APIExpectedMachineCreateRequest{
 				SiteID:              site.ID.String(),
@@ -396,6 +459,7 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 			expectedStatus:   http.StatusForbidden,
 			expectedErrorMsg: cutil.GetPtr("User does not have access to Site"),
 			rejectsMutation:  true,
+			failSKULookup:    true,
 		},
 		{
 			name: "Site access precedes existing SKU lookup",
@@ -415,15 +479,32 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 			rejectsMutation:  true,
 		},
 		{
-			name: "invalid SKU ID returns 422",
+			name: "invalid SKU takes precedence over duplicate MAC",
 			requestBody: model.APIExpectedMachineCreateRequest{
 				SiteID:              site.ID.String(),
-				BmcMacAddress:       "00:11:22:33:44:AA",
+				BmcMacAddress:       existingMAC,
 				DefaultBmcUsername:  cutil.GetPtr("admin"),
 				DefaultBmcPassword:  cutil.GetPtr("password"),
 				ChassisSerialNumber: "CHASSIS129",
 				SkuID:               cutil.GetPtr("invalid-sku-id-that-does-not-exist"),
 				Labels:              map[string]string{"env": "test"},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus:   http.StatusUnprocessableEntity,
+			expectedErrorMsg: cutil.GetPtr("SKU ID specified in request does not exist"),
+			rejectsMutation:  true,
+		},
+		{
+			name: "invalid SKU takes precedence over pending Site",
+			requestBody: model.APIExpectedMachineCreateRequest{
+				SiteID:              otherSite.ID.String(),
+				BmcMacAddress:       "00:11:22:33:44:AA",
+				ChassisSerialNumber: "CHASSIS-PENDING-SITE",
+				SkuID:               cutil.GetPtr("missing-sku"),
 			},
 			setupContext: func(c echo.Context) {
 				c.Set("user", createMockUser(org))
@@ -477,7 +558,17 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			skuLookupFailure.armed = tt.failSKULookup
+			skuLookupFailure.fired = false
+			skuLookupFailure.selects = 0
+			wantSKUFailure := tt.failSKULookup && tt.expectedStatus == http.StatusInternalServerError
 			workflowCallsBefore := len(mockTemporalClient.Calls)
+			var logs bytes.Buffer
+			if wantSKUFailure {
+				previousLogger := log.Logger
+				log.Logger = zerolog.New(zerolog.SyncWriter(&logs))
+				t.Cleanup(func() { log.Logger = previousLogger })
+			}
 			var countBefore int
 			if tt.rejectsMutation {
 				countBefore, err = dbSession.DB.NewSelect().Model((*cdbm.ExpectedMachine)(nil)).Count(ctx)
@@ -509,12 +600,32 @@ func TestCreateExpectedMachineHandler_Handle(t *testing.T) {
 			if tt.expectedStatus != rec.Code {
 				t.Errorf("Response: %v", rec.Body.String())
 			}
+			if tt.failSKULookup {
+				assert.Equal(t, wantSKUFailure, skuLookupFailure.fired, "Site authorization must precede the SKU attachment lookup")
+			}
+			if tt.expectedStatus == http.StatusForbidden {
+				assert.Zero(t, skuLookupFailure.selects, "denied requests must not perform any SKU lookup")
+			}
+			if wantSKUFailure {
+				assert.JSONEq(t, `{"source":"","message":"Failed to validate SKU ID in request data due to DB error","data":null}`, rec.Body.String())
+				var lookupErrorLog map[string]any
+				for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+					var entry map[string]any
+					require.NoError(t, json.Unmarshal([]byte(line), &entry))
+					if entry["message"] == "error validating SKU ID in request data" {
+						lookupErrorLog = entry
+					}
+				}
+				require.NotNil(t, lookupErrorLog, "SKU lookup failure must be logged")
+				assert.Equal(t, "error", lookupErrorLog["level"])
+				assert.Equal(t, context.Canceled.Error(), lookupErrorLog["error"])
+			}
 
 			if tt.rejectsMutation {
 				assert.Len(t, mockTemporalClient.Calls, workflowCallsBefore)
 				countAfter, readErr := dbSession.DB.NewSelect().Model((*cdbm.ExpectedMachine)(nil)).Count(ctx)
 				require.NoError(t, readErr)
-				assert.Equal(t, countBefore, countAfter, "rejected SKU must not create an Expected Machine")
+				assert.Equal(t, countBefore, countAfter, "rejected request must not create an Expected Machine")
 			}
 
 			// For successful creations, verify labels and rackId are returned in response
@@ -613,8 +724,8 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, machine)
 
-	// Create expected machines - one on managed site, one on unmanaged site
-	// Link the managed EM to the machine via machine_id
+	// Both Expected Machines reference `machine`. `unmanagedEM` deliberately
+	// stores that reference across Sites so reads must omit its expansion.
 	emDAO := cdbm.NewExpectedMachineDAO(dbSession)
 	managedEM, err := emDAO.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
 		ExpectedMachineID:        uuid.New(),
@@ -635,6 +746,7 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 		ChassisSerialNumber:      "UNMANAGED-CHASSIS",
 		SkuID:                    &foreignSKU.ID,
 		FallbackDpuSerialNumbers: []string{"DPU002"},
+		MachineID:                &machineID,
 	})
 	assert.Nil(t, err)
 	assert.NotNil(t, unmanagedEM)
@@ -1035,6 +1147,35 @@ func TestGetAllExpectedMachineHandler_Handle(t *testing.T) {
 			},
 		},
 		{
+			name:             "includeRelation=Machine omits foreign Site details from stored mismatch",
+			orgName:          dualRoleOrg,
+			siteId:           unmanagedSite.ID.String(),
+			includeRelations: []string{"Machine"},
+			setupContext: func(c echo.Context) {
+				c.Set("user", dualRoleUser)
+				c.SetParamNames("orgName")
+				c.SetParamValues(dualRoleOrg)
+			},
+			expectedStatus: http.StatusOK,
+			checkResponseContent: func(t *testing.T, body []byte) {
+				var response []model.APIExpectedMachine
+				require.NoError(t, json.Unmarshal(body, &response))
+				require.Len(t, response, 1)
+				assert.Equal(t, unmanagedEM.ID, response[0].ID)
+				assert.Equal(t, unmanagedEM.SiteID, response[0].SiteID)
+				assert.Equal(t, unmanagedEM.SkuID, response[0].SkuID)
+				assert.Equal(t, unmanagedEM.MachineID, response[0].MachineID)
+				assert.Nil(t, response[0].Machine)
+				var fields []map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(body, &fields))
+				assert.NotContains(t, fields[0], "machine")
+				assert.NotContains(t, string(body), *machine.ProductName)
+				stored, err := emDAO.Get(ctx, nil, unmanagedEM.ID, nil, false)
+				require.NoError(t, err)
+				assert.Equal(t, unmanagedEM, stored, "relation expansion must not rewrite stored associations")
+			},
+		},
+		{
 			name:    "dual-role org GetAll with siteId on provider-only site succeeds",
 			orgName: dualRoleOrg,
 			siteId:  dualRoleSiteNoTenant.ID.String(),
@@ -1171,6 +1312,16 @@ func TestGetExpectedMachineHandler_Handle(t *testing.T) {
 	testMachine, err := mDAO.Create(ctx, nil, createMachineInput)
 	assert.Nil(t, err)
 	assert.NotNil(t, testMachine)
+	foreignMachineID := uuid.NewString()
+	foreignMachine, err := mDAO.Create(ctx, nil, cdbm.MachineCreateInput{
+		MachineID:                foreignMachineID,
+		InfrastructureProviderID: unmanagedIP.ID,
+		SiteID:                   unmanagedSite.ID,
+		ControllerMachineID:      foreignMachineID,
+		ProductName:              cutil.GetPtr("private foreign Machine details"),
+		Status:                   cdbm.MachineStatusReady,
+	})
+	require.NoError(t, err)
 
 	// Create a test ExpectedMachine on managed site linked to the machine
 	emDAO := cdbm.NewExpectedMachineDAO(dbSession)
@@ -1203,8 +1354,9 @@ func TestGetExpectedMachineHandler_Handle(t *testing.T) {
 		ExpectedMachineID:   uuid.New(),
 		SiteID:              site.ID,
 		BmcMacAddress:       "00:11:22:33:44:AB",
-		ChassisSerialNumber: "LEGACY-SKU-MISMATCH",
+		ChassisSerialNumber: "LEGACY-SITE-MISMATCH",
 		SkuID:               &foreignSKU.ID,
+		MachineID:           &foreignMachine.ID,
 	})
 	require.NoError(t, err)
 
@@ -1287,6 +1439,33 @@ func TestGetExpectedMachineHandler_Handle(t *testing.T) {
 				assert.Equal(t, &foreignSKU.ID, response.SkuID)
 				assert.Nil(t, response.Sku)
 				assert.NotContains(t, string(body), foreignSKU.Description)
+				stored, err := emDAO.Get(ctx, nil, legacyEM.ID, nil, false)
+				require.NoError(t, err)
+				assert.Equal(t, legacyEM, stored, "relation expansion must not rewrite stored associations")
+			},
+		},
+		{
+			name:            "includeRelation=Machine omits foreign Site details from stored mismatch",
+			id:              legacyEM.ID.String(),
+			includeRelation: "Machine",
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, legacyEM.ID.String())
+			},
+			expectedStatus: http.StatusOK,
+			checkResponseContent: func(t *testing.T, body []byte) {
+				var response model.APIExpectedMachine
+				require.NoError(t, json.Unmarshal(body, &response))
+				assert.Equal(t, legacyEM.ID, response.ID)
+				assert.Equal(t, legacyEM.SiteID, response.SiteID)
+				assert.Equal(t, legacyEM.SkuID, response.SkuID)
+				assert.Equal(t, legacyEM.MachineID, response.MachineID)
+				assert.Nil(t, response.Machine)
+				var fields map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(body, &fields))
+				assert.NotContains(t, fields, "machine")
+				assert.NotContains(t, string(body), *foreignMachine.ProductName)
 				stored, err := emDAO.Get(ctx, nil, legacyEM.ID, nil, false)
 				require.NoError(t, err)
 				assert.Equal(t, legacyEM, stored, "relation expansion must not rewrite stored associations")
@@ -1440,8 +1619,12 @@ func TestBmcMacUnchanged(t *testing.T) {
 }
 
 func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
+	t.Run("pending batch identity conflict", func(t *testing.T) { testExpectedMachinePendingOverlap(t, "single update") })
 	t.Run("complete mutation conflict", func(t *testing.T) {
-		testExpectedMachineMutationRejectsCompleteMutationLock(t, "single update")
+		testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "single update"})
+	})
+	t.Run("SKU recreated on another Site before attachment", func(t *testing.T) {
+		testExpectedMachineRejectsRecreatedSKU(t, "single update")
 	})
 
 	tests := []struct {
@@ -1451,6 +1634,7 @@ func TestUpdateExpectedMachineHandler_Handle(t *testing.T) {
 		{name: "request validation and metadata", run: testUpdateExpectedMachineRequest},
 		{name: "BMC address presence", run: testUpdateExpectedMachineBmcIpAddress},
 		{name: "encrypted BMC credentials", run: testUpdateExpectedMachineBmcCredentials},
+		{name: "loopback replacement intent", run: testUpdateExpectedMachineLoopbacks},
 	}
 	for _, test := range tests {
 		t.Run(test.name, test.run)
@@ -1551,6 +1735,8 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 	scp.IDClientMap[site.ID.String()] = mockTemporalClient
 
 	handler := NewUpdateExpectedMachineHandler(dbSession, scp, cfg)
+	skuLookupFailure := &testExpectedMachineSKULookupFailureHook{}
+	dbSession.DB.AddQueryHook(skuLookupFailure)
 
 	// Helper function to create mock user
 	createMockUser := func(org string) *cdbm.User {
@@ -1577,6 +1763,7 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 		scheduleErr          error
 		expectedPaths        []string
 		rejectsMutation      bool
+		failSKULookup        bool
 		checkResponseContent func(t *testing.T, body []byte)
 	}{
 		{
@@ -1707,6 +1894,22 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 			},
 		},
 		{
+			name: "SKU lookup failure returns 500 without mutation or dispatch",
+			id:   testEM.ID.String(),
+			requestBody: model.APIExpectedMachineUpdateRequest{
+				SkuID:  cutil.GetPtr("test-sku-uuid-1"),
+				Labels: map[string]string{"env": "must-not-change"},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName", "id")
+				c.SetParamValues(org, testEM.ID.String())
+			},
+			expectedStatus:  http.StatusInternalServerError,
+			rejectsMutation: true,
+			failSKULookup:   true,
+		},
+		{
 			name: "foreign Site SKU returns 422",
 			id:   testEM.ID.String(),
 			requestBody: model.APIExpectedMachineUpdateRequest{
@@ -1740,6 +1943,7 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 			},
 			expectedStatus:  http.StatusForbidden,
 			rejectsMutation: true,
+			failSKULookup:   true,
 			checkResponseContent: func(t *testing.T, body []byte) {
 				var response cutil.APIError
 				require.NoError(t, json.Unmarshal(body, &response))
@@ -1767,10 +1971,11 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid SKU ID returns 422",
+			name: "invalid SKU takes precedence over changed MAC",
 			id:   testEM.ID.String(),
 			requestBody: model.APIExpectedMachineUpdateRequest{
-				SkuID: cutil.GetPtr("invalid-sku-id-for-update"),
+				SkuID:         cutil.GetPtr("invalid-sku-id-for-update"),
+				BmcMacAddress: cutil.GetPtr("AA:BB:CC:DD:EE:FF"),
 			},
 			setupContext: func(c echo.Context) {
 				c.Set("user", createMockUser(org))
@@ -1804,12 +2009,19 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			skuLookupFailure.armed = tt.failSKULookup
+			skuLookupFailure.fired = false
+			skuLookupFailure.selects = 0
+			wantSKUFailure := tt.failSKULookup && tt.expectedStatus == http.StatusInternalServerError
 			scheduleCall.Return(mockWorkflowRun, tt.scheduleErr)
 			workflowCallsBefore := len(mockTemporalClient.Calls)
 			var logs bytes.Buffer
 			before, err := emDAO.Get(ctx, nil, uuid.MustParse(tt.id), nil, false)
 			require.NoError(t, err)
-			if tt.scheduleErr != nil {
+			if wantSKUFailure {
+				require.NotEqual(t, before.Labels["env"], tt.requestBody.Labels["env"], "failure case must request a label change")
+			}
+			if tt.scheduleErr != nil || wantSKUFailure {
 				previousLogger := log.Logger
 				log.Logger = zerolog.New(zerolog.SyncWriter(&logs))
 				t.Cleanup(func() { log.Logger = previousLogger })
@@ -1834,6 +2046,26 @@ func testUpdateExpectedMachineRequest(t *testing.T) {
 			assert.Equal(t, tt.expectedStatus, rec.Code)
 			if tt.expectedStatus != rec.Code {
 				t.Errorf("Response: %v", rec.Body.String())
+			}
+			if tt.failSKULookup {
+				assert.Equal(t, wantSKUFailure, skuLookupFailure.fired, "Site authorization must precede the SKU attachment lookup")
+			}
+			if tt.expectedStatus == http.StatusForbidden {
+				assert.Zero(t, skuLookupFailure.selects, "denied requests must not perform any SKU lookup")
+			}
+			if wantSKUFailure {
+				assert.JSONEq(t, `{"source":"","message":"Failed to validate SKU ID in request data due to DB error","data":null}`, rec.Body.String())
+				var lookupErrorLog map[string]any
+				for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+					var entry map[string]any
+					require.NoError(t, json.Unmarshal([]byte(line), &entry))
+					if entry["message"] == "error validating SKU ID in request data" {
+						lookupErrorLog = entry
+					}
+				}
+				require.NotNil(t, lookupErrorLog, "SKU lookup failure must be logged")
+				assert.Equal(t, "error", lookupErrorLog["level"])
+				assert.Equal(t, context.Canceled.Error(), lookupErrorLog["error"])
 			}
 			if tt.scheduleErr != nil {
 				assert.Contains(t, logs.String(), tt.scheduleErr.Error())
@@ -2041,8 +2273,9 @@ func testUpdateExpectedMachineBmcIpAddress(t *testing.T) {
 }
 
 func TestDeleteExpectedMachineHandler_Handle(t *testing.T) {
+	t.Run("pending batch identity conflict", func(t *testing.T) { testExpectedMachinePendingOverlap(t, "single delete") })
 	t.Run("complete mutation conflict", func(t *testing.T) {
-		testExpectedMachineMutationRejectsCompleteMutationLock(t, "single delete")
+		testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "single delete"})
 	})
 
 	// Setup
@@ -2626,9 +2859,45 @@ func TestTenantWithTargetedInstanceCreationCapability(t *testing.T) {
 
 // TestCreateExpectedMachinesHandler_Handle tests the batch create handler
 func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
-	t.Run("complete mutation conflict", func(t *testing.T) {
-		testExpectedMachineMutationRejectsCompleteMutationLock(t, "batch create")
-	})
+	t.Run("default-off legacy batch creation", testExpectedMachineLegacyBatch)
+	t.Run("enabled durable batch recovery", testExpectedMachineBatchRecovery)
+	t.Run("admission failure does not dispatch", testExpectedMachineBatchAdmissionFailure)
+
+	t.Run("pending batch identity conflict", func(t *testing.T) { testExpectedMachinePendingOverlap(t, "batch create") })
+	mutationTests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{name: "complete mutation conflict", run: func(t *testing.T) {
+			testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "batch create"})
+		}},
+		{name: "SKU recreated on another Site before attachment", run: func(t *testing.T) {
+			testExpectedMachineRejectsRecreatedSKU(t, "batch create")
+		}},
+		{name: "shared inventory lock rejects batch serial admission", run: func(t *testing.T) {
+			testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "batch create", shared: true})
+		}},
+		{name: "workflow context bounds start and result wait", run: testExpectedMachineBatchCreateWorkflowDeadline},
+		{name: "stored serial differing only in case remains accepted", run: func(t *testing.T) {
+			testExpectedMachineBatchCreateStoredIdentity(t, expectedMachineStoredIdentityCase{
+				bmcMacAddress: "00:11:22:33:44:11", chassisSerialNumber: "ORIGINAL", status: http.StatusCreated,
+			})
+		}},
+		{name: "stored MAC duplicate is rejected", run: func(t *testing.T) {
+			testExpectedMachineBatchCreateStoredIdentity(t, expectedMachineStoredIdentityCase{
+				bmcMacAddress: "00:11:22:33:44:10", chassisSerialNumber: "new-serial", status: http.StatusBadRequest,
+			})
+		}},
+		{name: "serial admission sees batch committed before transaction", run: func(t *testing.T) {
+			testExpectedMachineBatchSerialAdmission(t, expectedMachineSerialAdmissionCase{mutation: "batch create"})
+		}},
+		{name: "serial admission refreshes snapshot after lock retry", run: func(t *testing.T) {
+			testExpectedMachineBatchSerialAdmission(t, expectedMachineSerialAdmissionCase{mutation: "batch create", commitAfterLockFailure: true})
+		}},
+	}
+	for _, test := range mutationTests {
+		t.Run(test.name, test.run)
+	}
 
 	// Setup
 	e := echo.New()
@@ -2637,7 +2906,7 @@ func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
 	dbSession := testExpectedMachineInitDB(t)
 	defer dbSession.Close()
 
-	cfg := common.GetTestConfig()
+	cfg := expectedMachineBatchRecoveryConfig(t)
 
 	// Prepare client pool for workflow calls
 	tcfg, _ := cfg.GetTemporalConfig()
@@ -2663,7 +2932,7 @@ func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
 	// Add mock temporal client for the site
 	mockTemporalClient := &tmocks.Client{}
 	mockWorkflowRun := &tmocks.WorkflowRun{}
-	mockWorkflowRun.On("GetID").Return("test-workflow-id")
+	mockWorkflowRun.On("GetRunID").Return("batch-create-run")
 
 	// Track workflow request to generate corresponding results
 	var capturedRequest interface{}
@@ -2677,8 +2946,8 @@ func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
 		}).
 		Return(mockWorkflowRun, nil)
 
-	// Mock Get to populate results based on captured request
-	mockWorkflowRun.Mock.On("Get", mock.Anything, mock.Anything).
+	// Mock the exact run result based on the captured request
+	mockWorkflowRun.Mock.On("GetWithOptions", mock.Anything, mock.Anything, tclient.WorkflowRunGetOptions{DisableFollowingRuns: true}).
 		Run(func(args mock.Arguments) {
 			// Cast result to BatchExpectedMachineOperationResponse and populate
 			if resultPtr, ok := args.Get(1).(*corev1.BatchExpectedMachineOperationResponse); ok {
@@ -3048,14 +3317,14 @@ func TestCreateExpectedMachinesHandler_Handle(t *testing.T) {
 	}
 }
 
-// TestCreateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow is a regression test for a
+// testCreateExpectedMachineBmcCredentialsForwardedToWorkflow is a regression test for a
 // bug where the OpenAPI spec documented "bmcUsername" / "bmcPassword" as the request field names
 // while the Go struct (APIExpectedMachineCreateRequest) used JSON tags "defaultBmcUsername" /
 // "defaultBmcPassword". Clients following the spec sent keys that the JSON decoder could not bind,
 // leaving DefaultBmcUsername / DefaultBmcPassword nil and silently dropping credentials before
 // they reached the workflow. The spec has been corrected to use "defaultBmcUsername" /
 // "defaultBmcPassword" to match the Go struct tags.
-func TestCreateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow(t *testing.T) {
+func testCreateExpectedMachineBmcCredentialsForwardedToWorkflow(t *testing.T) {
 	e := echo.New()
 	dbSession := testExpectedMachineInitDB(t)
 	defer dbSession.Close()
@@ -3135,7 +3404,7 @@ func TestCreateExpectedMachineHandler_BmcCredentialsForwardedToWorkflow(t *testi
 	}
 }
 
-func TestCreateExpectedMachineHandler_DpfEnabledForwardedToWorkflow(t *testing.T) {
+func testCreateExpectedMachineDpfEnabledForwardedToWorkflow(t *testing.T) {
 	e := echo.New()
 	dbSession := testExpectedMachineInitDB(t)
 	defer dbSession.Close()
@@ -3330,6 +3599,7 @@ func testUpdateExpectedMachineBmcCredentials(t *testing.T) {
 			assert.Equal(t, http.StatusOK, rec.Code, "Response: %s", rec.Body.String())
 			require.NotNil(t, capturedPatch, "workflow should have received a request")
 			assert.Equal(t, []string{tt.expectedPath}, capturedPatch.UpdateMask.Paths)
+			assert.False(t, capturedPatch.ExpectedMachine.ReplaceDpuLoopbacks)
 			assert.Equal(t, tt.expectedUsername, capturedPatch.ExpectedMachine.BmcUsername)
 			assert.Equal(t, tt.expectedPassword, capturedPatch.ExpectedMachine.BmcPassword)
 			if tt.expectedPath == "host_nics" {
@@ -3348,11 +3618,120 @@ func testUpdateExpectedMachineBmcCredentials(t *testing.T) {
 	}
 }
 
+func testUpdateExpectedMachineLoopbacks(t *testing.T) {
+	dbSession := testExpectedMachineInitDB(t)
+	t.Cleanup(func() { dbSession.Close() })
+	ctx := context.Background()
+	const org = "test-org"
+	_, site := testExpectedMachineSetupTestData(t, dbSession, org)
+	user := &cdbm.User{OrgData: cdbm.OrgData{org: cdbm.Org{Name: org, Roles: []string{authz.ProviderAdminRole}}}}
+	dao := cdbm.NewExpectedMachineDAO(dbSession)
+	physical := cdbm.ExpectedMachineInterface{
+		MacAddress: cutil.GetPtr("02:00:00:00:00:20"), Role: cutil.GetPtr(cdbm.ExpectedInterfaceRoleDpuOs),
+		FixedIP: cutil.GetPtr("192.0.2.20"), IPAllocation: cutil.GetPtr(cdbm.ExpectedInterfaceIPAllocationFixed),
+	}
+	loopback := cdbm.ExpectedMachineInterface{
+		MacAddress: physical.MacAddress, Role: cutil.GetPtr(cdbm.ExpectedInterfaceRoleDpuLoopback),
+		FixedIP: cutil.GetPtr("198.51.100.20"), IPAllocation: cutil.GetPtr(cdbm.ExpectedInterfaceIPAllocationFixed),
+	}
+	existing, err := dao.Create(ctx, nil, cdbm.ExpectedMachineCreateInput{
+		ExpectedMachineID: uuid.New(), SiteID: site.ID, BmcMacAddress: "00:11:22:33:44:20", ChassisSerialNumber: "LOOPBACK-PATCH",
+	})
+	require.NoError(t, err)
+	client := &tmocks.Client{}
+	run := &tmocks.WorkflowRun{}
+	var captured corev1.PatchExpectedMachineRequest
+	client.On("ExecuteWorkflow", mock.Anything, mock.Anything, grpcproxy.Core.WorkflowName, mock.Anything).
+		Run(func(args mock.Arguments) {
+			captured = corev1.PatchExpectedMachineRequest{}
+			testDecodeExpectedComponentPatch(t, args.Get(3), site.ID.String(), &captured)
+		}).Return(run, nil)
+	run.On("Get", mock.Anything, mock.Anything).Return(nil)
+	pool := sc.NewClientPool(nil)
+	pool.IDClientMap[site.ID.String()] = client
+	handler := NewUpdateExpectedMachineHandler(dbSession, pool, common.GetTestConfig())
+	physicalJSON := `{"macAddress":"02:00:00:00:00:20","role":"DpuOs","fixedIp":"192.0.2.20","ipAllocation":"Fixed"}`
+	tests := []struct {
+		name               string
+		body               string
+		wantPhysical       bool
+		wantLoopback       string
+		wantWireCount      int
+		wantReplace        bool
+		editAfterPreflight bool
+	}{
+		{
+			name:         "physical update preserves reservation edited after preflight",
+			body:         `{"interfaces":[` + physicalJSON + `]}`,
+			wantPhysical: true, wantLoopback: "198.51.100.30", wantWireCount: 1, editAfterPreflight: true,
+		},
+		{
+			name: "empty physical list preserves reservation",
+			body: `{"interfaces":[]}`, wantLoopback: "198.51.100.20",
+		},
+		{
+			name:         "explicit clear retains submitted physical declaration",
+			body:         `{"interfaces":[` + physicalJSON + `],"replaceDpuLoopbacks":true}`,
+			wantPhysical: true, wantWireCount: 1, wantReplace: true,
+		},
+		{
+			name:         "supplied loopback replaces prior declaration without flag",
+			body:         `{"interfaces":[{"macAddress":"02:00:00:00:00:20","role":"DpuLoopback","fixedIp":"2001:db8::20","ipAllocation":"Fixed"}]}`,
+			wantLoopback: "2001:db8::20", wantWireCount: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := dao.Update(ctx, nil, cdbm.ExpectedMachineUpdateInput{
+				ExpectedMachineID: existing.ID, Interfaces: []cdbm.ExpectedMachineInterface{physical, loopback},
+			})
+			require.NoError(t, err)
+			if test.editAfterPreflight {
+				hook := &expectedMachineQueryHook{
+					queryPrefix: `SELECT "em".`, armed: true,
+					afterQuery: func(_ *bun.QueryEvent) {
+						changed := loopback
+						changed.FixedIP = cutil.GetPtr("198.51.100.30")
+						_, err := dao.Update(ctx, nil, cdbm.ExpectedMachineUpdateInput{
+							ExpectedMachineID: existing.ID, Interfaces: []cdbm.ExpectedMachineInterface{physical, changed},
+						})
+						require.NoError(t, err)
+					},
+				}
+				dbSession.DB.AddQueryHook(hook)
+				t.Cleanup(func() { require.True(t, hook.fired, "reservation edit must happen after preflight") })
+			}
+			recorder := invokeExpectedInventoryMutationHandler(t, user, org, http.MethodPatch,
+				"/v2/org/test-org/nico/expected-machine/"+existing.ID.String(), test.body, existing.ID.String(), handler.Handle)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.NotNil(t, captured.ExpectedMachine)
+			require.Equal(t, []string{"host_nics"}, captured.UpdateMask.Paths)
+			require.Equal(t, test.wantReplace, captured.ExpectedMachine.ReplaceDpuLoopbacks)
+			require.Len(t, captured.ExpectedMachine.HostNics, test.wantWireCount, "only submitted declarations should reach Core")
+			stored, err := dao.Get(ctx, nil, existing.ID, nil, false)
+			require.NoError(t, err)
+			want := []cdbm.ExpectedMachineInterface{}
+			if test.wantPhysical {
+				want = append(want, physical)
+			}
+			if test.wantLoopback != "" {
+				reservation := loopback
+				reservation.FixedIP = cutil.GetPtr(test.wantLoopback)
+				want = append(want, reservation)
+			}
+			require.Equal(t, want, stored.Interfaces)
+			var response model.APIExpectedMachine
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+			require.Equal(t, model.NewAPIExpectedMachine(stored).Interfaces, response.Interfaces)
+		})
+	}
+}
+
 func TestExpectedMachineUpdateFields(t *testing.T) {
-	t.Run("tracks every request field except ID and BMC IP address", func(t *testing.T) {
+	t.Run("tracks every request field except ID and per-machine exceptions", func(t *testing.T) {
 		requestFieldCount := reflect.TypeOf(model.APIExpectedMachineUpdateRequest{}).NumField()
 		updateFieldCount := reflect.TypeOf(expectedMachineUpdateFieldSet{}).NumField()
-		assert.Equal(t, requestFieldCount-2, updateFieldCount)
+		assert.Equal(t, requestFieldCount-3, updateFieldCount)
 	})
 
 	fieldPresenceTests := []struct {
@@ -3368,6 +3747,11 @@ func TestExpectedMachineUpdateFields(t *testing.T) {
 		{
 			name:      "BMC IP address may vary per machine",
 			setField:  func(req *model.APIExpectedMachineUpdateRequest) { req.BmcIpAddress = cutil.GetPtr("192.0.2.10") },
+			wantEqual: true,
+		},
+		{
+			name:      "loopback replacement intent may vary per machine",
+			setField:  func(req *model.APIExpectedMachineUpdateRequest) { req.ReplaceDpuLoopbacks = cutil.GetPtr(true) },
 			wantEqual: true,
 		},
 		{
@@ -3488,14 +3872,27 @@ func TestExpectedMachineUpdateFields(t *testing.T) {
 }
 
 func TestUpdateExpectedMachinesHandler_Handle(t *testing.T) {
-	t.Run("complete mutation conflict", func(t *testing.T) {
-		testExpectedMachineMutationRejectsCompleteMutationLock(t, "batch update")
-	})
-
+	t.Run("pending batch identity conflict", func(t *testing.T) { testExpectedMachinePendingOverlap(t, "batch update") })
 	tests := []struct {
 		name string
 		run  func(*testing.T)
 	}{
+		{name: "complete mutation conflict", run: func(t *testing.T) {
+			testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "batch update"})
+		}},
+		{name: "SKU recreated on another Site before attachment", run: func(t *testing.T) {
+			testExpectedMachineRejectsRecreatedSKU(t, "batch update")
+		}},
+		{name: "shared inventory lock rejects batch serial admission", run: func(t *testing.T) {
+			testExpectedMachineMutationRejectsInventoryLock(t, expectedMachineMutationLockCase{mutation: "batch update", shared: true})
+		}},
+		{name: "serial admission sees batch committed before transaction", run: func(t *testing.T) {
+			testExpectedMachineBatchSerialAdmission(t, expectedMachineSerialAdmissionCase{mutation: "batch update"})
+		}},
+		{name: "serial admission refreshes snapshot after lock retry", run: func(t *testing.T) {
+			testExpectedMachineBatchSerialAdmission(t, expectedMachineSerialAdmissionCase{mutation: "batch update", commitAfterLockFailure: true})
+		}},
+		{name: "legacy duplicate serial metadata and reassertion", run: testExpectedMachineBatchLegacySerial},
 		{name: "request validation and metadata", run: testUpdateExpectedMachinesRequest},
 		{name: "mixed BMC address presence", run: testUpdateExpectedMachinesBmcIpAddress},
 	}
@@ -3601,7 +3998,11 @@ func testUpdateExpectedMachinesRequest(t *testing.T) {
 		BmcMacAddress:            "00:11:22:33:44:10",
 		ChassisSerialNumber:      "BATCH-UPDATE-001",
 		FallbackDpuSerialNumbers: []string{"DPU010"},
-		Labels:                   map[string]string{"env": "test"},
+		Interfaces: []cdbm.ExpectedMachineInterface{{
+			MacAddress: cutil.GetPtr("02:00:00:00:00:20"), FixedIP: cutil.GetPtr("198.51.100.20"),
+			Role: cutil.GetPtr(cdbm.ExpectedInterfaceRoleDpuLoopback), IPAllocation: cutil.GetPtr(cdbm.ExpectedInterfaceIPAllocationFixed),
+		}},
+		Labels: map[string]string{"env": "test"},
 	})
 	assert.Nil(t, err)
 
@@ -3619,7 +4020,11 @@ func testUpdateExpectedMachinesRequest(t *testing.T) {
 		BmcMacAddress:            "00:11:22:33:44:11",
 		ChassisSerialNumber:      "BATCH-UPDATE-002",
 		FallbackDpuSerialNumbers: []string{"DPU011"},
-		Labels:                   map[string]string{"env": "test"},
+		Interfaces: []cdbm.ExpectedMachineInterface{{
+			MacAddress: cutil.GetPtr("02:00:00:00:00:21"), FixedIP: cutil.GetPtr("198.51.100.21"),
+			Role: cutil.GetPtr(cdbm.ExpectedInterfaceRoleDpuLoopback), IPAllocation: cutil.GetPtr(cdbm.ExpectedInterfaceIPAllocationFixed),
+		}},
+		Labels: map[string]string{"env": "test"},
 	})
 	assert.Nil(t, err)
 
@@ -3689,6 +4094,52 @@ func testUpdateExpectedMachinesRequest(t *testing.T) {
 		rejectsSKU         bool
 		validateResp       func(t *testing.T, body []byte)
 	}{
+		{
+			name: "batch preserves loopbacks unless each machine requests replacement",
+			requestBody: []model.APIExpectedMachineUpdateRequest{
+				{ID: cutil.GetPtr(testEM1.ID.String()), Interfaces: model.APIExpectedMachineInterfaces{}},
+				{ID: cutil.GetPtr(testEM2.ID.String()), ReplaceDpuLoopbacks: cutil.GetPtr(true), Interfaces: model.APIExpectedMachineInterfaces{{
+					MacAddress: cutil.GetPtr("02:00:00:00:00:21"), Role: cutil.GetPtr(cdbm.ExpectedInterfaceRoleDpuOs),
+				}}},
+			},
+			setupContext: func(c echo.Context) {
+				c.Set("user", createMockUser(org))
+				c.SetParamNames("orgName")
+				c.SetParamValues(org)
+			},
+			expectedStatus: http.StatusOK,
+			validateResp: func(t *testing.T, body []byte) {
+				require.NotNil(t, capturedRequest)
+				require.Len(t, capturedRequest.Patches, 2)
+				for _, patch := range capturedRequest.Patches {
+					assert.Equal(t, []string{"host_nics"}, patch.UpdateMask.Paths)
+					clearing := patch.ExpectedMachine.GetId().GetValue() == testEM2.ID.String()
+					assert.Equal(t, clearing, patch.ExpectedMachine.ReplaceDpuLoopbacks)
+					if clearing {
+						require.Len(t, patch.ExpectedMachine.HostNics, 1)
+						assert.Equal(t, corev1.ExpectedInterfaceRole_EXPECTED_INTERFACE_ROLE_DPU_OS, patch.ExpectedMachine.HostNics[0].GetRole())
+					} else {
+						assert.Empty(t, patch.ExpectedMachine.HostNics, "cached loopbacks must not be sent as fresh intent")
+					}
+				}
+				var response []model.APIExpectedMachine
+				require.NoError(t, json.Unmarshal(body, &response))
+				require.Len(t, response, 2)
+				for _, machine := range response {
+					stored, err := emDAO.Get(ctx, nil, machine.ID, nil, false)
+					require.NoError(t, err)
+					require.Len(t, stored.Interfaces, 1)
+					require.Len(t, machine.Interfaces, 1)
+					wantRole := cdbm.ExpectedInterfaceRoleDpuLoopback
+					if machine.ID == testEM2.ID {
+						wantRole = cdbm.ExpectedInterfaceRoleDpuOs
+					}
+					assert.Equal(t, cutil.GetPtr(wantRole), stored.Interfaces[0].Role)
+					assert.Equal(t, stored.Interfaces[0].Role, machine.Interfaces[0].Role)
+					assert.Equal(t, stored.Interfaces[0].FixedIP, machine.Interfaces[0].FixedIP)
+				}
+			},
+		},
 		{
 			name: "batch password-only updates remain correlated and encrypted",
 			requestBody: []model.APIExpectedMachineUpdateRequest{
@@ -4180,7 +4631,7 @@ func testUpdateExpectedMachinesRequest(t *testing.T) {
 		})
 	}
 
-	mockTemporalClient.AssertNumberOfCalls(t, "ExecuteWorkflow", 5)
+	mockTemporalClient.AssertNumberOfCalls(t, "ExecuteWorkflow", 6)
 	storedEM1, err := emDAO.Get(ctx, nil, testEM1.ID, nil, false)
 	require.NoError(t, err)
 	storedEM2, err := emDAO.Get(ctx, nil, testEM2.ID, nil, false)

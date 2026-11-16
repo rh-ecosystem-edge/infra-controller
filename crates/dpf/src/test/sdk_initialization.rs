@@ -35,7 +35,7 @@ use crate::crds::dpuflavortemplates_generated::DPUFlavorTemplate;
 use crate::crds::dpus_generated::{DPU, DpuStatusPhase};
 use crate::crds::dpuserviceconfigurations_generated::DPUServiceConfiguration;
 use crate::crds::dpuserviceinterfaces_generated::DPUServiceInterface;
-use crate::crds::dpuservicenads_generated::DPUServiceNAD;
+use crate::crds::dpuservicenads_generated::{DPUServiceNAD, DpuServiceNadDpuClusterSelector};
 use crate::crds::dpuservicetemplates_generated::DPUServiceTemplate;
 use crate::error::DpfError;
 use crate::repository::{
@@ -44,12 +44,100 @@ use crate::repository::{
     DpuServiceConfigurationRepository, DpuServiceInterfaceRepository, DpuServiceNADRepository,
     DpuServiceTemplateRepository, K8sConfigRepository,
 };
-use crate::sdk::ResourceLabeler;
+use crate::sdk::{ResourceLabeler, apply_or_validate_service_nad};
 use crate::types::*;
 
 const TEST_NS: &str = "sdk-init-ns";
 const MIGRATION_MARKER_SERVICE_NAME: &str = "migration-marker";
 const MIGRATION_MARKER_RESOURCE_NAME: &str = "migration-marker-bf4astra";
+
+#[tokio::test]
+async fn existing_external_service_nad_is_preserved_when_compatible() {
+    let mock = InitializationMock::default();
+    let desired = crate::sdk::build_service_nad(
+        &ServiceNAD {
+            name: "mybrhbn".to_string(),
+            bridge: Some("br-hbn".to_string()),
+            ipam: Some(false),
+            resource_type: ServiceNADResourceType::Sf,
+            mtu: Some(9_216),
+        },
+        TEST_NS,
+        "",
+    );
+    let mut existing = desired.clone();
+    existing.spec.service_mtu = Some(1_500);
+    mock.nads.insert(resource_key(&existing), existing);
+
+    apply_or_validate_service_nad(&mock, &desired)
+        .await
+        .expect("compatible external NAD must be preserved");
+    let stored = DpuServiceNADRepository::get(&mock, "mybrhbn", TEST_NS)
+        .await
+        .expect("external NAD lookup succeeds")
+        .expect("external NAD remains present");
+    assert_eq!(stored.spec.service_mtu, Some(1_500));
+}
+
+#[tokio::test]
+async fn incompatible_external_service_nad_is_not_overwritten() {
+    let mock = InitializationMock::default();
+    let desired = crate::sdk::build_service_nad(
+        &ServiceNAD {
+            name: "mybrhbn".to_string(),
+            bridge: Some("br-hbn".to_string()),
+            ipam: Some(false),
+            resource_type: ServiceNADResourceType::Sf,
+            mtu: Some(9_216),
+        },
+        TEST_NS,
+        "",
+    );
+    let mut existing = desired.clone();
+    existing.spec.bridge = Some("external-bridge".to_string());
+    mock.nads.insert(resource_key(&existing), existing.clone());
+
+    let error = apply_or_validate_service_nad(&mock, &desired)
+        .await
+        .expect_err("incompatible external NAD must not be overwritten");
+    assert!(error.to_string().contains("incompatible bridge"));
+    let stored = DpuServiceNADRepository::get(&mock, "mybrhbn", TEST_NS)
+        .await
+        .expect("external NAD lookup succeeds")
+        .expect("external NAD remains present");
+    assert_eq!(stored.spec.bridge, Some("external-bridge".to_string()));
+}
+
+#[tokio::test]
+async fn external_service_nad_restricted_to_another_cluster_is_rejected() {
+    let mock = InitializationMock::default();
+    let desired = crate::sdk::build_service_nad(
+        &ServiceNAD {
+            name: "mybrhbn".to_string(),
+            bridge: Some("br-hbn".to_string()),
+            ipam: Some(false),
+            resource_type: ServiceNADResourceType::Sf,
+            mtu: Some(9_216),
+        },
+        TEST_NS,
+        "",
+    );
+    let mut existing = desired.clone();
+    existing.spec.dpu_cluster_selector = Some(DpuServiceNadDpuClusterSelector {
+        match_labels: Some(BTreeMap::from([("site".to_string(), "other".to_string())])),
+        match_expressions: None,
+    });
+    mock.nads.insert(resource_key(&existing), existing);
+
+    let error = apply_or_validate_service_nad(&mock, &desired)
+        .await
+        .expect_err("a cluster-scoped NAD cannot serve all NICo DPU clusters");
+    assert!(
+        error
+            .to_string()
+            .contains("restrictive DPU cluster selector")
+    );
+}
 
 fn ns_key(ns: &str, name: &str) -> String {
     format!("{}/{}", ns, name)
@@ -289,7 +377,7 @@ impl BfbRepository for InitializationMock {
         let mut bfb_with_status = bfb.clone();
         bfb_with_status.status = Some(BfbStatus {
             file_name: None,
-            phase: BfbStatusPhase::Ready,
+            phase: Some(BfbStatusPhase::Ready),
             versions: None,
             conditions: None,
             observed_generation: None,
@@ -652,6 +740,10 @@ impl K8sConfigRepository for InitializationMock {
 
 #[async_trait]
 impl DpfOperatorConfigRepository for InitializationMock {
+    async fn get_version(&self, _: &str, _: &str) -> Result<String, DpfError> {
+        Ok(super::helpers::DPF_VERSION.to_string())
+    }
+
     async fn get(
         &self,
         _name: &str,
@@ -884,7 +976,8 @@ async fn unscoped_astra_split_initialization_writes_no_resources() {
 /// Verifies public initialization persists aligned HBN configuration and chain references.
 /// BF3's legacy BFB path and generic BF4's scoped software path must both retain slot wiring.
 /// Complete five-slot DHCP attachments must retain their bridges and MTU while ordinary DHCP/FMDS
-/// NADs keep their existing rendering and deployment-specific references; the flavor must render the configured pool.
+/// NADs keep their existing rendering, ordinary service-chain switches omit MTU overrides, and the
+/// flavor must render the configured pool.
 #[tokio::test]
 async fn service_vpc_initialization_keeps_hbn_configuration_and_chain_aligned() {
     for (deployment_type, sf_pool, sf_bar_size, resource_suffix, interface_suffix) in [
@@ -1026,6 +1119,19 @@ async fn service_vpc_initialization_keeps_hbn_configuration_and_chain_aligned() 
             .service_chains
             .expect("chains exist")
             .switches;
+        // Confirm ordinary chains retain DPF's default because only fixed slot patches qualify for
+        // the jumbo MTU override.
+        assert!(switches.iter().all(|switch| {
+            switch.service_mtu.is_none()
+                || switch.ports.iter().any(|port| {
+                    port.service_interface.as_ref().is_some_and(|interface| {
+                        interface
+                            .match_labels
+                            .get("interface")
+                            .is_some_and(|name| name.starts_with("service-vpc-slot-"))
+                    })
+                })
+        }));
         for (index, listener) in listeners
             .iter()
             .filter(|listener| listener.name.starts_with("d_iface_svc_"))
@@ -1081,16 +1187,19 @@ async fn service_vpc_initialization_keeps_hbn_configuration_and_chain_aligned() 
                     .peer_bridge,
                 format!("br-svc-{index}")
             );
-            assert!(
-                switches
-                    .iter()
-                    .any(|switch| switch.ports.iter().any(|port| {
+            // Every fixed slot switch must retain the qualified 9,000-byte MTU.
+            let slot_switch = switches
+                .iter()
+                .find(|switch| {
+                    switch.ports.iter().any(|port| {
                         port.service.as_ref().is_some_and(|service| {
                             service.name == DOCA_HBN_SERVICE_NAME
                                 && service.interface == format!("iface_svc_{index}")
                         })
-                    }))
-            );
+                    })
+                })
+                .expect("service-VPC chain must reference the HBN interface");
+            assert_eq!(slot_switch.service_mtu, Some(9_000));
         }
 
         // Ordinary service NADs retain their bridge, resource type, IPAM and MTU after the multi-NAD change.
@@ -1293,7 +1402,8 @@ async fn test_create_initialization_objects_bluefield_software() {
 }
 
 /// Verifies every DPF profile consumes one intercept topology while retaining isolated flavors,
-/// interfaces, chains, and selectors so Astra's fixed xplane resources cannot cross-bind.
+/// interfaces, chains, and selectors so Astra's fixed xplane resources cannot cross-bind or inherit
+/// a service-VPC slot MTU.
 #[tokio::test]
 async fn scoped_bf3_gb200_bf4_and_astra_initialization_coexists() {
     // Build one SDK so all four deployment classes share the production namespace.
@@ -1616,16 +1726,21 @@ async fn scoped_bf3_gb200_bf4_and_astra_initialization_coexists() {
         assert!(ovs_script.contains("add-br 'br-vf4'"));
         assert!(ovs_script.contains(expected_ovs_marker));
 
-        let expected_labels = InitializationLabeler
+        let selector = deployment.spec.dpus.dpu_sets.as_ref().unwrap()[0]
+            .dpu_node_selector
+            .as_ref()
+            .unwrap();
+        let mut expected_labels = InitializationLabeler
             .node_labels_for_deployment_type(deployment_type)
             .unwrap();
+        expected_labels.remove(DPU_ENABLED_NODE_LABEL);
+        assert_eq!(selector.match_labels.as_ref(), Some(&expected_labels));
+        let selector_json = serde_json::to_value(selector).unwrap();
         assert_eq!(
-            deployment.spec.dpus.dpu_sets.as_ref().unwrap()[0]
-                .dpu_node_selector
-                .as_ref()
-                .and_then(|selector| selector.match_labels.as_ref()),
-            Some(&expected_labels)
+            selector_json["matchExpressions"][0]["key"],
+            DPU_ENABLED_NODE_LABEL
         );
+        assert_eq!(selector_json["matchExpressions"][0]["operator"], "Exists");
 
         // Service-chain ports must expose the exact runtime endpoints for the same inventory.
         let switches = &deployment.spec.service_chains.as_ref().unwrap().switches;
@@ -1677,21 +1792,32 @@ async fn scoped_bf3_gb200_bf4_and_astra_initialization_coexists() {
         );
     }
 
-    // Astra mode sets `astraEnabled` and retains the labeler's Astra-class node selector.
+    // Astra mode sets `astraEnabled` and retains the Astra-class label selector.
     let astra = DpuDeploymentRepository::get(&mock, "astra-deployment", TEST_NS)
         .await
         .unwrap()
         .expect("Astra deployment must exist");
     assert_eq!(astra.spec.dpus.astra_enabled, Some(true));
-    let expected_astra_labels = InitializationLabeler
+    let mut expected_astra_labels = InitializationLabeler
         .node_labels_for_deployment_type(DpuDeploymentType::Bf4Astra)
         .unwrap();
+    expected_astra_labels.remove(DPU_ENABLED_NODE_LABEL);
+    let astra_selector = astra.spec.dpus.dpu_sets.as_ref().unwrap()[0]
+        .dpu_node_selector
+        .as_ref()
+        .unwrap();
     assert_eq!(
-        astra.spec.dpus.dpu_sets.as_ref().unwrap()[0]
-            .dpu_node_selector
-            .as_ref()
-            .and_then(|selector| selector.match_labels.as_ref()),
+        astra_selector.match_labels.as_ref(),
         Some(&expected_astra_labels)
+    );
+    let astra_selector_json = serde_json::to_value(astra_selector).unwrap();
+    assert_eq!(
+        astra_selector_json["matchExpressions"][0]["key"],
+        DPU_ENABLED_NODE_LABEL
+    );
+    assert_eq!(
+        astra_selector_json["matchExpressions"][0]["operator"],
+        "Exists"
     );
     let astra_switches = &astra.spec.service_chains.as_ref().unwrap().switches;
     // Each service chain and fixed xplane pair must appear once; the set checks below hide
@@ -1699,6 +1825,12 @@ async fn scoped_bf3_gb200_bf4_and_astra_initialization_coexists() {
     assert_eq!(
         astra_switches.len(),
         astra_chainable_logical_names.len() + astra_xplane_group_ids.len()
+    );
+    // Confirm Astra leaves every switch MTU unset because the profile rejects service-VPC slots.
+    assert!(
+        astra_switches
+            .iter()
+            .all(|switch| switch.service_mtu.is_none())
     );
     // Astra service-to-service chains must select the configured topology logical names while its
     // fixed xplane-to-CX chains remain present.

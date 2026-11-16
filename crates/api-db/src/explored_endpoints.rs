@@ -16,6 +16,7 @@
  */
 use std::net::IpAddr;
 
+use carbide_uuid::machine::MachineId;
 use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
 use const_format::concatcp;
@@ -691,6 +692,26 @@ pub async fn request_exploration_for_addresses(
     Ok(())
 }
 
+/// Sets `exploration_requested = true` on the BMC endpoints of `machine_id`
+/// so the site explorer revisits the machine on its next tick. A machine
+/// whose BMC interface has no address or no endpoint row is left alone.
+pub(crate) async fn request_exploration_for_machine(
+    machine_id: &MachineId,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    let query = "UPDATE explored_endpoints SET exploration_requested = true \
+                 WHERE address IN (\
+                     SELECT mia.address FROM machine_interfaces mi \
+                     JOIN machine_interface_addresses mia ON mia.interface_id = mi.id \
+                     WHERE mi.interface_type = 'Bmc' AND mi.machine_id = $1)";
+    sqlx::query(query)
+        .bind(machine_id)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    Ok(())
+}
+
 async fn set_preingestion(
     address: IpAddr,
     state: PreingestionState,
@@ -784,6 +805,15 @@ pub async fn set_preingestion_time_sync_reset(
     set_preingestion(address, state, txn).await
 }
 
+/// The firmware check asked for one refreshed report; the endpoint waits in
+/// `FirmwareCheckRefreshWait` and the check runs again on that report.
+pub async fn set_preingestion_firmware_check_refresh_wait(
+    address: IpAddr,
+    txn: &mut PgConnection,
+) -> Result<(), DatabaseError> {
+    set_preingestion(address, PreingestionState::FirmwareCheckRefreshWait, txn).await
+}
+
 pub async fn set_preingestion_recheck_versions_reason(
     address: IpAddr,
     reason: String,
@@ -874,56 +904,71 @@ pub async fn set_preingestion_script_running(
     set_preingestion(address, state, txn).await
 }
 
+/// Queue BFB recovery with the DPU BMC MAC validated by the caller.
+/// `None` preserves an unbound legacy state, which workers reject before another
+/// copy or power-off; new requests must supply the resolved MAC.
 pub async fn set_preingestion_bfb_recovery_needed(
     address: IpAddr,
     reason: String,
     host_bmc_ip: IpAddr,
     pre_copy_powercycle: bool,
+    dpu_bmc_mac: Option<MacAddress>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let state = PreingestionState::BfbRecoveryNeeded {
         reason,
         host_bmc_ip,
+        dpu_bmc_mac,
         pre_copy_powercycle,
     };
     set_preingestion(address, state, txn).await
 }
 
+/// Persist a BFB host power-cycle phase while retaining the queued DPU BMC MAC.
+/// An unbound legacy recovery can restore host power, but cannot start another copy or power-off.
 pub async fn set_preingestion_bfb_platform_powercycle(
     address: IpAddr,
     host_bmc_ip: IpAddr,
     phase: model::site_explorer::BfbPlatformPowercyclePhase,
     post_install: bool,
+    dpu_bmc_mac: Option<MacAddress>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let state = PreingestionState::BfbPlatformPowercycle {
         host_bmc_ip,
+        dpu_bmc_mac,
         phase,
         post_install,
     };
     set_preingestion(address, state, txn).await
 }
 
+/// Record BFB copy dispatch, retaining the DPU BMC MAC for recovery after a worker restart.
 pub async fn set_preingestion_bfb_copy_in_progress(
     address: IpAddr,
     host_bmc_ip: IpAddr,
+    dpu_bmc_mac: Option<MacAddress>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let state = PreingestionState::BfbCopyInProgress {
         started_at: Utc::now(),
         host_bmc_ip,
+        dpu_bmc_mac,
     };
     set_preingestion(address, state, txn).await
 }
 
+/// Record BFB installation polling with the DPU BMC identity retained from copy dispatch.
 pub async fn set_preingestion_bfb_installation_wait(
     address: IpAddr,
     host_bmc_ip: IpAddr,
+    dpu_bmc_mac: Option<MacAddress>,
     txn: &mut PgConnection,
 ) -> Result<(), DatabaseError> {
     let state = PreingestionState::BfbInstallationWait {
         started_at: Utc::now(),
         host_bmc_ip,
+        dpu_bmc_mac,
     };
     set_preingestion(address, state, txn).await
 }
@@ -1307,6 +1352,7 @@ mod tests {
 
         let timeout = EndpointExplorationError::ConnectionTimeout {
             details: "deadline exceeded".to_string(),
+            consecutive_count: 1,
         };
         let latency = std::time::Duration::from_secs(2);
         assert_eq!(

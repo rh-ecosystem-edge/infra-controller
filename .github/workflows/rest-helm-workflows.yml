@@ -58,19 +58,83 @@ jobs:
 
       - name: Test Temporal chart addresses
         if: matrix.chart == 'rest-api/temporal-helm/temporal'
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-unittest@fdc2fa4b5f14ae570f290218f102f9b4aad3b26e
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-unittest@db3780bff4b2cbf90ba9117a63e41ddea066791b
         with:
           plugin-oci-ref: oci://nvcr.io/0837451325059433/carbide-dev/unittest:1.1.2
           registry-password: ${{ secrets.NVCR_STG_TOKEN }}
           charts: rest-api/temporal-helm/temporal
 
+  verify-securitycontext-configurable:
+    name: Verify pod securityContext is overridable
+    if: ${{ !cancelled() && github.event_name != 'schedule' }}
+    runs-on: linux-amd64-cpu4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Assert podSecurityContext override is honored
+        # Regression guard: every nico-rest workload must let the operator
+        # replace the chart's default pod securityContext (e.g. drop the
+        # hardcoded runAsUser/fsGroup so OpenShift can inject a range UID).
+        # Rendering each subchart with its podSecurityContext set to null must
+        # leave zero runAsUser in the output; a chart that hardcodes it
+        # instead of using `{{- with .Values.podSecurityContext }}` fails here.
+        # Subcharts are rendered directly: Helm's coalescing keeps a subchart's
+        # own values.yaml default when the parent nulls the key from the
+        # umbrella (--set nico-rest-api.podSecurityContext=null has no effect),
+        # so the umbrella cannot exercise this contract.
+        run: |
+          set -euo pipefail
+          cd helm/rest/nico-rest/charts
+          for chart in nico-rest-api nico-rest-workflow nico-rest-site-manager nico-rest-cert-manager nico-rest-db; do
+            sets=(--set podSecurityContext=null)
+            # Subchart templates dereference .Values.global.*; supply the
+            # umbrella's globals so the render reaches the assertion instead
+            # of failing on a nil pointer.
+            sets+=(
+              --set global.image.repository=test
+              --set global.image.tag=test
+              --set global.certificate.issuerRef.name=test-issuer
+            )
+            if [ "${chart}" = "nico-rest-api" ]; then
+              # The api ConfigMap refuses to render without an auth issuer.
+              sets+=(
+                --set config.keycloak.enabled=true
+                --set config.keycloak.baseURL=http://keycloak:8082
+                --set config.keycloak.realm=test
+                --set config.keycloak.clientID=test
+              )
+            fi
+            rendered="$(helm template t "${chart}" "${sets[@]}")"
+            count="$(printf '%s\n' "${rendered}" | grep -c 'runAsUser' || true)"
+            if [ "${count}" -ne 0 ]; then
+              echo "::error::${chart}: podSecurityContext is not overridable — found ${count} runAsUser entries after --set podSecurityContext=null."
+              printf '%s\n' "${rendered}" | grep -n 'runAsUser' || true
+              exit 1
+            fi
+            echo "OK: ${chart} renders no runAsUser when podSecurityContext is nulled."
+          done
+
   push-charts:
     name: Push Helm Charts
     needs:
       - validate-charts
-    if: ${{ !cancelled() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && needs.validate-charts.result == 'success' && !contains(github.ref, 'pull-request/') }}
+      - verify-securitycontext-configurable
+    if: ${{ !cancelled() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && needs.validate-charts.result == 'success' && needs.verify-securitycontext-configurable.result == 'success' && !contains(github.ref, 'pull-request/') }}
     runs-on: linux-amd64-cpu4
     strategy:
+      # NGC answers an upload with HTTP 409 while another upload to the same
+      # namespace is updating its chart index, and the CLI reports that as
+      # "already exists". One chart at a time keeps this matrix from colliding
+      # with itself, and `fail-fast: false` lets the other charts publish when
+      # one of them fails.
+      fail-fast: false
+      max-parallel: 1
       matrix:
         chart:
           - helm/rest/nico-rest
@@ -85,9 +149,7 @@ jobs:
 
       - name: Install yq for umbrella packaging
         if: matrix.chart == 'helm/rest/nico-rest' && inputs.ngc_path != ''
-        # Keep install-yq-action at v1.1.1 to match the pinned helm-package-push action:
-        # https://github.com/dsx-ai-factory/dsx-github-actions/blob/7de619729962a6bd5e8355b6fb3582a22517d7e5/.github/actions/helm-package-push/action.yml#L64
-        uses: dcarbone/install-yq-action@64b1b9eb28920bb1a4c13c05321df284f9a8f940 # v1.1.1
+        uses: dcarbone/install-yq-action@4075b4dca348d74bd83f2bf82d30f25d7c54539b # v1.3.1
         with:
           version: v4.35.1
 
@@ -111,7 +173,7 @@ jobs:
 
       - name: Package and push Helm chart to NGC
         if: ${{ inputs.ngc_path != '' }}
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@7de619729962a6bd5e8355b6fb3582a22517d7e5
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@db3780bff4b2cbf90ba9117a63e41ddea066791b # v1.29.0
         with:
           chart-path: ${{ steps.prepare-umbrella.outputs.chart_path || matrix.chart }}
           chart-version: ${{ inputs.chart_version }}
@@ -119,4 +181,5 @@ jobs:
           lint: 'false'
           ngc-key: ${{ secrets.NICO_NGC_TOKEN || secrets.NVCR_STG_TOKEN }}
           ngc-path: ${{ inputs.ngc_path }}
-          ngc-duplicate: fail
+          ngc-duplicate: verify
+          retries: 3
