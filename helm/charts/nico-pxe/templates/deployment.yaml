@@ -83,7 +83,7 @@ spec:
         {{- $_ := set $container "image" (include "nico.containerImage" (dict "container" $entry "path" (printf "%s.initContainers[%d]" $.Chart.Name $index))) }}
         {{- toYaml (list $container) | nindent 8 }}
         {{- end }}
-        {{- if .Values.bootArtifactContainers }}
+        {{- if and .Values.bootArtifactContainers .Values.bootArtifacts.fixPermissions }}
         - name: boot-artifacts-permissions
           image: "{{ include "nico-pxe.image" . }}"
           imagePullPolicy: {{ include "nico-pxe.imagePullPolicy" . }}

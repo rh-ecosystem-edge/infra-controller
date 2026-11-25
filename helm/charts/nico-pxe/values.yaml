@@ -124,16 +124,21 @@ initContainers: []
 ## NOTE: copy ONLY directories that exist in the image. The boot-artifacts-aarch64 image
 ## ships /aarch64 and /apt (NOT /firmware); copying a missing dir makes `cp` exit non-zero
 ## and the init container crash-loops.
-## When populated, the chart mounts an emptyDir and appends a root init container
-## after all other init containers to set group 10001 and grant group read/traverse
-## on the copied trees, including source files with mode 0600. Existing copy
-## commands work without migration. No world permissions are added.
-## The final init uses /bin/sh, chgrp, and chmod from the selected PXE image.
+## When populated and bootArtifacts.fixPermissions is true (the default), the
+## chart mounts an emptyDir and appends a root init container after all other
+## init containers to set group 10001 and grant group read/traverse on the
+## copied trees, including source files with mode 0600. Existing copy commands
+## work without migration. No world permissions are added. The final init uses
+## /bin/sh, chgrp, and chmod from the selected PXE image.
 ## ⚠ That permissions init runs as UID 0 with CHOWN/FOWNER/DAC_OVERRIDE
 ## capabilities, so OpenShift's restricted-v2 SCC rejects the pod regardless of
 ## the containerSecurityContext/podSecurityContext overrides. On restricted
-## SCCs, either bind a more permissive SCC to the service account or bundle the
-## boot artifacts in a compatible PXE image (leave this list empty).
+## SCCs without a permissive SCC available, set bootArtifacts.fixPermissions:
+## false and have each bootArtifactContainers command leave files group-owned
+## by the serving group (10001, or podSecurityContext.fsGroup when overridden)
+## and group-readable itself — see the chgrp/chmod already included in the
+## sample commands below — or bundle the boot artifacts in a compatible PXE
+## image instead (leave this list empty).
 ## When empty, no boot-artifacts volume is mounted, preserving image-bundled files.
 ## Quote tags (for example, tag: "1.10") to preserve their exact text.
 ## YAML parses unquoted 1.10 as 1.1; unquoted 0 is treated as empty and falls
@@ -161,6 +166,13 @@ bootArtifactContainers: []
 ## at <servePath>/blobs/internal. Otherwise it serves the image's existing files.
 bootArtifacts:
   servePath: /forge-boot-artifacts
+  ## Append the privileged boot-artifacts-permissions init container (see
+  ## bootArtifactContainers above) whenever bootArtifactContainers is
+  ## populated. Set to false on SCCs that reject UID 0 + CHOWN/FOWNER/
+  ## DAC_OVERRIDE (e.g. OpenShift restricted-v2) once every
+  ## bootArtifactContainers command leaves correctly group-owned,
+  ## group-readable files itself.
+  fixPermissions: true
 
 annotations:
   configmap.reloader.stakater.com/reload: '{{ include "nico-pxe.name" . }}-env-config'
